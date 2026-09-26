@@ -1,13 +1,13 @@
 """Numerical kernels for TPE density estimation and annealing proposals."""
 
-from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu import global_idx
+from max.gpu.host import DeviceContext
 from std.math import erf, exp, log, sqrt
 from std.sys import simd_width_of
 
 
-comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
-comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
+comptime FPtr = Pointer[Float64, AnyOrigin[mut=True]]
+comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
 comptime EPS = 1.0e-12
 comptime SQRT_2 = 1.4142135623730950488
 comptime SQRT_2PI = 2.5066282746310005024
@@ -45,10 +45,10 @@ def acceptance(
         var lower = Float64(0.0)
         var upper = Float64(1.0)
         if has_low:
-            lower = normal_cdf(low, mus[j], sigmas[j])
+            lower = normal_cdf(low, mus[unsafe_offset=j], sigmas[unsafe_offset=j])
         if has_high:
-            upper = normal_cdf(high, mus[j], sigmas[j])
-        total += weights[j] * (upper - lower)
+            upper = normal_cdf(high, mus[unsafe_offset=j], sigmas[unsafe_offset=j])
+        total += weights[unsafe_offset=j] * (upper - lower)
     return total
 
 
@@ -74,74 +74,75 @@ def gmm_lpdf(
         for i in range(n):
             var max_term = -1.0e300
             for j in range(k):
-                var sigma = sigmas[j]
+                var sigma = sigmas[unsafe_offset=j]
                 if sigma < EPS:
                     sigma = EPS
-                var z = (samples[i] - mus[j]) / sigma
-                var term = -0.5 * z * z + log(weights[j] / (SQRT_2PI * sigma))
+                var z = (samples[unsafe_offset=i] - mus[unsafe_offset=j]) / sigma
+                var term = -0.5 * z * z + log(weights[unsafe_offset=j] / (SQRT_2PI * sigma))
                 if term > max_term:
                     max_term = term
             var total = Float64(0.0)
             for j in range(k):
-                var sigma = sigmas[j]
+                var sigma = sigmas[unsafe_offset=j]
                 if sigma < EPS:
                     sigma = EPS
-                var z = (samples[i] - mus[j]) / sigma
-                var term = -0.5 * z * z + log(weights[j] / (SQRT_2PI * sigma))
+                var z = (samples[unsafe_offset=i] - mus[unsafe_offset=j]) / sigma
+                var term = -0.5 * z * z + log(weights[unsafe_offset=j] / (SQRT_2PI * sigma))
                 total += exp(term - max_term)
-            result[i] = log(total) + max_term - log(p_accept)
+            result[unsafe_offset=i] = log(total) + max_term - log(p_accept)
         return
 
     for i in range(n):
-        var lower = samples[i] - 0.5 * q
-        var upper = samples[i] + 0.5 * q
+        var lower = samples[unsafe_offset=i] - 0.5 * q
+        var upper = samples[unsafe_offset=i] + 0.5 * q
         if has_low and lower < low:
             lower = low
         if has_high and upper > high:
             upper = high
         var probability = Float64(0.0)
         for j in range(k):
-            probability += weights[j] * (
-                normal_cdf(upper, mus[j], sigmas[j])
-                - normal_cdf(lower, mus[j], sigmas[j])
+            probability += weights[unsafe_offset=j] * (
+                normal_cdf(upper, mus[unsafe_offset=j], sigmas[unsafe_offset=j])
+                - normal_cdf(lower, mus[unsafe_offset=j], sigmas[unsafe_offset=j])
             )
-        result[i] = log(probability) - log(p_accept)
+        result[unsafe_offset=i] = log(probability) - log(p_accept)
 
 
 def gmm_lpdf_gpu_kernel(
     samples: FPtr,
-    n: Int,
+    n: Int32,
     log_coefficients: FPtr,
     mus: FPtr,
     sigmas: FPtr,
-    k: Int,
-    log_space: Int,
+    k: Int32,
+    log_space: Int32,
     result: FPtr,
 ):
-    var i = global_idx.x
-    if i >= n:
+    # Kernel arguments must be DevicePassable: 1.2.0 rejects index-sized Int.
+    var i = Int(global_idx.x)
+    if i >= Int(n):
         return
-    var sample = samples[i]
+    var sample = samples[unsafe_offset=i]
     var transformed = log(sample) if log_space != 0 else sample
     var jacobian = transformed if log_space != 0 else 0.0
     var max_term = -1.0e300
     for j in range(k):
-        var sigma = sigmas[j]
+        var sigma = sigmas[unsafe_offset=j]
         if sigma < EPS:
             sigma = EPS
-        var z = (transformed - mus[j]) / sigma
-        var term = -0.5 * z * z + log_coefficients[j] - jacobian
+        var z = (transformed - mus[unsafe_offset=j]) / sigma
+        var term = -0.5 * z * z + log_coefficients[unsafe_offset=j] - jacobian
         if term > max_term:
             max_term = term
     var total = Float64(0.0)
     for j in range(k):
-        var sigma = sigmas[j]
+        var sigma = sigmas[unsafe_offset=j]
         if sigma < EPS:
             sigma = EPS
-        var z = (transformed - mus[j]) / sigma
-        var term = -0.5 * z * z + log_coefficients[j] - jacobian
+        var z = (transformed - mus[unsafe_offset=j]) / sigma
+        var term = -0.5 * z * z + log_coefficients[unsafe_offset=j] - jacobian
         total += exp(term - max_term)
-    result[i] = log(total) + max_term
+    result[unsafe_offset=i] = log(total) + max_term
 
 
 def gmm_lpdf_gpu(
@@ -168,12 +169,12 @@ def gmm_lpdf_gpu(
     var blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
     ctx.enqueue_function[gmm_lpdf_gpu_kernel](
         device_samples,
-        n,
+        Int32(n),
         device_coefficients,
         device_mus,
         device_sigmas,
-        k,
-        log_space,
+        Int32(k),
+        Int32(log_space),
         device_result,
         grid_dim=blocks,
         block_dim=BLOCK_SIZE,
@@ -213,35 +214,35 @@ def lgmm_lpdf(
         for i in range(n):
             var max_term = -1.0e300
             for j in range(k):
-                var sigma = sigmas[j]
+                var sigma = sigmas[unsafe_offset=j]
                 if sigma < EPS:
                     sigma = EPS
-                var z = (log(samples[i]) - mus[j]) / sigma
+                var z = (log(samples[unsafe_offset=i]) - mus[unsafe_offset=j]) / sigma
                 var term = (
                     -0.5 * z * z
-                    + log(weights[j])
-                    - log(SQRT_2PI * sigma * samples[i])
+                    + log(weights[unsafe_offset=j])
+                    - log(SQRT_2PI * sigma * samples[unsafe_offset=i])
                 )
                 if term > max_term:
                     max_term = term
             var total = Float64(0.0)
             for j in range(k):
-                var sigma = sigmas[j]
+                var sigma = sigmas[unsafe_offset=j]
                 if sigma < EPS:
                     sigma = EPS
-                var z = (log(samples[i]) - mus[j]) / sigma
+                var z = (log(samples[unsafe_offset=i]) - mus[unsafe_offset=j]) / sigma
                 var term = (
                     -0.5 * z * z
-                    + log(weights[j])
-                    - log(SQRT_2PI * sigma * samples[i])
+                    + log(weights[unsafe_offset=j])
+                    - log(SQRT_2PI * sigma * samples[unsafe_offset=i])
                 )
                 total += exp(term - max_term)
-            result[i] = log(total) + max_term
+            result[unsafe_offset=i] = log(total) + max_term
         return
 
     for i in range(n):
-        var lower = samples[i] - 0.5 * q
-        var upper = samples[i] + 0.5 * q
+        var lower = samples[unsafe_offset=i] - 0.5 * q
+        var upper = samples[unsafe_offset=i] + 0.5 * q
         if lower < 0.0:
             lower = 0.0
         if has_low:
@@ -254,11 +255,11 @@ def lgmm_lpdf(
                 upper = exp_high
         var probability = Float64(0.0)
         for j in range(k):
-            probability += weights[j] * (
-                lognormal_cdf(upper, mus[j], sigmas[j])
-                - lognormal_cdf(lower, mus[j], sigmas[j])
+            probability += weights[unsafe_offset=j] * (
+                lognormal_cdf(upper, mus[unsafe_offset=j], sigmas[unsafe_offset=j])
+                - lognormal_cdf(lower, mus[unsafe_offset=j], sigmas[unsafe_offset=j])
             )
-        result[i] = log(probability) - log(p_accept)
+        result[unsafe_offset=i] = log(probability) - log(p_accept)
 
 
 def forgetting_weight(index: Int, n: Int, lf: Int) -> Float64:
@@ -287,50 +288,50 @@ def adaptive_parzen(
     order: IPtr,
 ):
     if n == 0:
-        weights[0] = 1.0
-        mus[0] = prior_mu
-        sigmas[0] = prior_sigma
+        weights[unsafe_offset=0] = 1.0
+        mus[unsafe_offset=0] = prior_mu
+        sigmas[unsafe_offset=0] = prior_sigma
         return
 
     var prior_pos = 0
-    while prior_pos < n and observations[Int(order[prior_pos])] < prior_mu:
+    while prior_pos < n and observations[unsafe_offset=Int(order[unsafe_offset=prior_pos])] < prior_mu:
         prior_pos += 1
 
     for j in range(prior_pos):
-        mus[j] = observations[Int(order[j])]
-    mus[prior_pos] = prior_mu
+        mus[unsafe_offset=j] = observations[unsafe_offset=Int(order[unsafe_offset=j])]
+    mus[unsafe_offset=prior_pos] = prior_mu
     for j in range(prior_pos, n):
-        mus[j + 1] = observations[Int(order[j])]
+        mus[unsafe_offset=j + 1] = observations[unsafe_offset=Int(order[unsafe_offset=j])]
 
     var count = n + 1
     if count == 2:
-        sigmas[0] = prior_sigma
-        sigmas[1] = prior_sigma
+        sigmas[unsafe_offset=0] = prior_sigma
+        sigmas[unsafe_offset=1] = prior_sigma
         if prior_pos == 0:
-            sigmas[1] = prior_sigma * 0.5
+            sigmas[unsafe_offset=1] = prior_sigma * 0.5
         else:
-            sigmas[0] = prior_sigma * 0.5
+            sigmas[unsafe_offset=0] = prior_sigma * 0.5
     else:
-        sigmas[0] = mus[1] - mus[0]
-        sigmas[count - 1] = mus[count - 1] - mus[count - 2]
+        sigmas[unsafe_offset=0] = mus[unsafe_offset=1] - mus[unsafe_offset=0]
+        sigmas[unsafe_offset=count - 1] = mus[unsafe_offset=count - 1] - mus[unsafe_offset=count - 2]
         comptime W = simd_width_of[DType.float64]()
         var j = 1
         var vector_end = 1 + ((count - 2) // W) * W
         while j < vector_end:
-            var center = mus.load[width=W](j)
-            var left = center - mus.load[width=W](j - 1)
-            var right = mus.load[width=W](j + 1) - center
-            sigmas.store(j, max(left, right))
+            var center = mus.unsafe_load[width=W](j)
+            var left = center - mus.unsafe_load[width=W](j - 1)
+            var right = mus.unsafe_load[width=W](j + 1) - center
+            sigmas.unsafe_store(j, max(left, right))
             j += W
         while j < count - 1:
-            sigmas[j] = max(mus[j] - mus[j - 1], mus[j + 1] - mus[j])
+            sigmas[unsafe_offset=j] = max(mus[unsafe_offset=j] - mus[unsafe_offset=j - 1], mus[unsafe_offset=j + 1] - mus[unsafe_offset=j])
             j += 1
 
     for j in range(prior_pos):
-        weights[j] = forgetting_weight(Int(order[j]), n, lf)
-    weights[prior_pos] = prior_weight
+        weights[unsafe_offset=j] = forgetting_weight(Int(order[unsafe_offset=j]), n, lf)
+    weights[unsafe_offset=prior_pos] = prior_weight
     for j in range(prior_pos, n):
-        weights[j + 1] = forgetting_weight(Int(order[j]), n, lf)
+        weights[unsafe_offset=j + 1] = forgetting_weight(Int(order[unsafe_offset=j]), n, lf)
 
     var min_divisor = min(100.0, Float64(1 + count))
     var min_sigma = prior_sigma / min_divisor
@@ -340,28 +341,28 @@ def adaptive_parzen(
     var min_sigma_vec = SIMD[DType.float64, W](min_sigma)
     var prior_sigma_vec = SIMD[DType.float64, W](prior_sigma)
     while j < vector_end:
-        var sigma = sigmas.load[width=W](j)
-        sigmas.store(j, max(min_sigma_vec, min(prior_sigma_vec, sigma)))
+        var sigma = sigmas.unsafe_load[width=W](j)
+        sigmas.unsafe_store(j, max(min_sigma_vec, min(prior_sigma_vec, sigma)))
         j += W
     while j < count:
-        sigmas[j] = max(min_sigma, min(prior_sigma, sigmas[j]))
+        sigmas[unsafe_offset=j] = max(min_sigma, min(prior_sigma, sigmas[unsafe_offset=j]))
         j += 1
-    sigmas[prior_pos] = prior_sigma
+    sigmas[unsafe_offset=prior_pos] = prior_sigma
 
     var total = Float64(0.0)
     j = 0
     while j < vector_end:
-        total += weights.load[width=W](j).reduce_add()
+        total += weights.unsafe_load[width=W](j).reduce_add()
         j += W
     while j < count:
-        total += weights[j]
+        total += weights[unsafe_offset=j]
         j += 1
     j = 0
     while j < vector_end:
-        weights.store(j, weights.load[width=W](j) / total)
+        weights.unsafe_store(j, weights.unsafe_load[width=W](j) / total)
         j += W
     while j < count:
-        weights[j] /= total
+        weights[unsafe_offset=j] /= total
         j += 1
 
 
@@ -526,17 +527,17 @@ def mho_categorical_lpdf(
     var log_probabilities = fp(log_probabilities_addr)
     var result = fp(result_addr)
     for i in range(n):
-        if samples[i] < 0 or samples[i] >= Int64(category_count):
+        if samples[unsafe_offset=i] < 0 or samples[unsafe_offset=i] >= Int64(category_count):
             return 0
     comptime W = simd_width_of[DType.float64]()
     var i = 0
     var vector_end = (n // W) * W
     while i < vector_end:
-        var indices = samples.load[width=W](i)
-        result.store(i, log_probabilities.gather(indices))
+        var indices = samples.unsafe_load[width=W](i)
+        result.unsafe_store(i, log_probabilities.unsafe_gather(indices))
         i += W
     while i < n:
-        result[i] = log_probabilities[Int(samples[i])]
+        result[unsafe_offset=i] = log_probabilities[unsafe_offset=Int(samples[unsafe_offset=i])]
         i += 1
     return 1
 
@@ -568,14 +569,14 @@ def mho_anneal_bounds(
     var i = 0
     var vector_end = (n // W) * W
     while i < vector_end:
-        var center = centers.load[width=W](i)
+        var center = centers.unsafe_load[width=W](i)
         center = max(min_center_vec, min(max_center_vec, center))
-        lower.store(i, center - half)
-        upper.store(i, center + half)
+        lower.unsafe_store(i, center - half)
+        upper.unsafe_store(i, center + half)
         i += W
     while i < n:
-        var center = max(min_center, min(max_center, centers[i]))
-        lower[i] = center - half
-        upper[i] = center + half
+        var center = max(min_center, min(max_center, centers[unsafe_offset=i]))
+        lower[unsafe_offset=i] = center - half
+        upper[unsafe_offset=i] = center + half
         i += 1
     return 1
