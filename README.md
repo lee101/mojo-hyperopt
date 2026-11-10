@@ -79,45 +79,62 @@ already-built shared library.
 ## Performance
 
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz,
-Linux 6.8.0-136-generic x86-64 with glibc 2.39. Times are the best of repeated
+Linux 6.8.0-147-generic x86-64 with glibc 2.39. Times are the best of repeated
 runs on identical input.
 
-| benchmark | before | after | hyperopt 0.2.7 | speedup |
+The `SIMD phase` table below is the change made by this phase: every row is
+from one `pixi run bench` before the change and one after it, on the same
+machine in the same session, with the load average under 30 (other jobs share
+this host; timings move by a few percent run to run and the upstream column is
+noisier still).
+
+| benchmark | before (two-pass, scalar inner loop) | after (SIMD rows) | hyperopt 0.2.7 (after run) | speedup |
 | --- | ---: | ---: | ---: | ---: |
-| adaptive Parzen, 20k observations | 0.99 ms | 0.97 ms | 1.28 ms | 1.33x |
-| GMM log-density, 200k x 48 | 501.25 ms | 188.90 ms | 349.81 ms | 1.85x |
-| GMM log-density GPU, 200k x 48 | 528.46 ms | 26.45 ms | 507.50 ms | 19.18x |
-| quantized GMM log-mass, 100k x 32 | 113.33 ms | 65.04 ms | 218.52 ms | 3.36x |
-| log-GMM log-density, 200k x 48 | 567.07 ms | 263.75 ms | 773.12 ms | 2.93x |
-| categorical log-density, 5M | 50.58 ms | 50.92 ms | 95.99 ms | 1.88x |
-| annealing bounds, 5M centers | 13.31 ms | 13.56 ms | 82.44 ms | 6.08x |
-| TPE `fmin`, 200 cheap evaluations | 236.20 ms | 212.53 ms | 656.36 ms | 3.09x |
-| anneal `fmin`, 500 cheap evaluations | 485.34 ms | 478.40 ms | 923.16 ms | 1.93x |
+| adaptive Parzen, 20k observations | 1.11 ms | 1.13 ms | 1.53 ms | 1.35x |
+| GMM log-density, 200k x 48 | 189.77 ms | 156.02 ms | 532.35 ms | 3.41x |
+| GMM log-density GPU, 200k x 48 | 253.14 ms | 200.07 ms | 501.04 ms | 2.50x |
+| quantized GMM log-mass, 100k x 32 | 66.11 ms | 66.93 ms | 225.77 ms | 3.37x |
+| log-GMM log-density, 200k x 48 | 286.54 ms | 223.81 ms | 534.31 ms | 2.39x |
+| categorical log-density, 5M | 34.24 ms | 31.85 ms | 67.29 ms | 2.11x |
+| annealing bounds, 5M centers | 9.69 ms | 8.88 ms | 47.12 ms | 5.30x |
+| TPE `fmin`, 200 cheap evaluations | 221.29 ms | 221.04 ms | 683.69 ms | 3.09x |
+| anneal `fmin`, 500 cheap evaluations | 484.70 ms | 457.76 ms | 861.55 ms | 1.88x |
 
-"before" and "after" are separate `pixi run bench` runs on the same machine,
-one for the previous build and one for the unrolled kernels; the upstream column
-is from the "after" run. Rows further down the table than the density kernels
-moved only within run-to-run noise. The GPU row was 528 ms in the "before" run
-because the device request silently fell back to the CPU on that run; with the
-same kernels as before it ran on the device again at 26 ms.
+Only the two density kernels changed. Their paired medians, measured by calling
+the two builds' exported kernels alternately in one process so shared-host noise
+hits both equally (15 rounds, 200k x 48), are GMM 189.8 ms to 163.2 ms and
+log-GMM 276.0 ms to 228.2 ms. The GPU row fell with them because in that run the
+device request fell back to the CPU; the GPU kernel itself is unchanged. The
+adaptive Parzen, quantized GMM, categorical and annealing-bounds rows were
+already SIMD from the earlier phases and moved only within noise; they are kept
+in the table to show that.
 
+| kernel | what the phase did |
+| --- | --- |
+| `gmm_lpdf`, `lgmm_lpdf` (unquantized) | Component terms are now formed with `W`-lane loads (`component_log_terms`) instead of one scalar division and log per component: a maximum pass and a second exponential-sum pass, with four SIMD accumulators in the sum pass and a scalar tail. `log(x)` for the log-normal space is hoisted to once per row. |
+| fused single pass over the same data | Tried, measured, and **reverted**: folding the maximum into the summing pass needs every component exponentiated twice (once to fold it into the running maximum), and it was 200 ms against 189.8 ms for GMM and 272 ms against 258 ms for log-GMM. The maximum pass here only ever builds cheap underflowing exponentials, so two passes with one exp per component wins. |
+| quantized `gmm_lpdf` line integral | Tried `W`-lane `erf`; measured 64.4 ms against 63.7 ms, so **reverted**. The compiler's `erf` is also only correct for SIMD arguments with `|x| <= 1`, which the line integral cannot guarantee. |
+| 8 accumulators instead of 4 | Tried; 178 ms against 159 ms for GMM, so **reverted**. Two accumulator pairs in the maximum pass was neutral and is not kept. |
+| `mho_anneal_bounds` | Already a single fused SIMD pass over contiguous input with two streamed outputs at every size; no change was faster. |
+| `adaptive_parzen`, `categorical_lpdf` | Already SIMD in the contiguous loops; no change was faster. |
+
+The SIMD width is read from the built library (`mojohyperopt.tpe.simd_width()`,
+exported as `mho_simd_width`), and `tests/test_simd_lengths.py` drives every
+vectorised kernel at lengths 0, 1, W-1, W, W+1, 4W, 4W+1, 97 and 100001 for
+component counts 1, W-1, W, W+1, 3W and 48, so the scalar tails run. Deleting
+one tail iteration makes 54 of those tests fail.
+
+The unquantized density kernels keep the earlier unroll's summation shape:
+lanes are accumulated separately and merged once, and the log-Gaussian row
+`log(samples[i])` is computed once per sample instead of twice per component.
 Adaptive Parzen uses NumPy's optimized `argsort` and passes its index buffer
-directly to Mojo, avoiding the former scalar merge sort and scratch allocation.
-The remaining contiguous sigma and normalization loops use SIMD. Categorical
-likelihood builds its small log-probability table once and uses SIMD gathers.
-Annealing bounds uses SIMD on every size and a reusable eight-worker pool above
-one million centers.
-
-The unquantized Gaussian and log-Gaussian densities walk eight mixture
-components per step with eight independent partial sums, and the per-component
-normalising constant is hoisted out of the inner loops (the log-Gaussian row
-`log(samples[i])` is computed once per sample instead of twice per component).
-This changes the floating-point summation order, so results can differ from the
-previous build and from Hyperopt in the last bits; the parity tests keep their
-original tolerances. Quantized GMM uses the same eight-way accumulation.
-Measured effect on the density kernels at the benchmark sizes: GMM 491 ms to
-182 ms, log-GMM 566 ms to 264 ms, quantized GMM 113 ms to 64 ms, and every
-output agrees with the previous build to within 2e-15.
+directly to Mojo; its sigma and normalisation loops, the categorical gather and
+the annealing-bounds clamp/offset pass are SIMD over contiguous buffers, with
+annealing bounds above one million centers split across a reusable eight-worker
+pool.
+Summation order still differs from upstream in the last bits, so the parity
+tests keep their `rtol=1e-6, atol=3e-7` tolerances; against upstream the SIMD
+rows differ by at most 1.3e-8 absolute at the benchmark size.
 
 Unbounded, unquantized GMM and log-GMM evaluation also accept `device="gpu"`.
 This is an explicit opt-in because transfers and device setup are not worthwhile

@@ -77,6 +77,15 @@ def _gpu_lpdf(
     return True
 
 
+def simd_width() -> int:
+    """Float64 lanes used by the SIMD kernels, read from the built library.
+
+    Tests size their coverage around this so the scalar tail is exercised on
+    whatever the compiler picked for the host.
+    """
+    return int(_lib.lib().mho_simd_width())
+
+
 def linear_forgetting_weights(N, LF):
     if N < 0 or LF <= 0:
         raise ValueError("require N >= 0 and LF > 0")

@@ -28,6 +28,7 @@ _SIGNATURES = {
     ),
     "mho_categorical_lpdf": ([I, I, I, I, I], I),
     "mho_anneal_bounds": ([I, I, F, F, F, I, I], I),
+    "mho_simd_width": ([], I),
 }
 
 

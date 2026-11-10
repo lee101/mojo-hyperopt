@@ -11,9 +11,13 @@ comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
 comptime EPS = 1.0e-12
 comptime SQRT_2 = 1.4142135623730950488
 comptime SQRT_2PI = 2.5066282746310005024
-# Components are walked LANES at a time with independent partial sums, combined
-# once at the end: a single running sum serialises on floating-point add latency.
+# The quantized line integral walks LANES components at a time with independent
+# partial sums, combined once at the end: a single running sum serialises on
+# floating-point add latency. The unquantized rows use W-lane SIMD accumulators.
 comptime LANES = 8
+comptime W = simd_width_of[DType.float64]()
+comptime MODE_GMM = 0
+comptime MODE_LOG = 1
 
 def fp(addr: Int) -> FPtr:
     return FPtr(unsafe_from_address=addr)
@@ -38,6 +42,94 @@ def normal_log_term(x: Float64, mu: Float64, weight: Float64, sigma: Float64) ->
 def lognormal_log_term(x: Float64, log_x: Float64, mu: Float64, weight: Float64, sigma: Float64) -> Float64:
     var z = (log_x - mu) / sigma
     return -0.5 * z * z + log(weight) - log(SQRT_2PI * sigma * x)
+
+
+def component_log_terms[mode: Int](
+    x: Float64,
+    log_x: Float64,
+    mus: FPtr,
+    weights: FPtr,
+    sigmas: FPtr,
+    j: Int,
+) -> SIMD[DType.float64, W]:
+    """W component log-terms starting at j, in the selected density space.
+
+    The log-normal form reproduces `lognormal_log_term` operation for operation;
+    the per-row `log(x)` is computed once and passed in.
+    """
+    var mu = mus.unsafe_load[width=W](j)
+    var sg = sigmas.unsafe_load[width=W](j)
+    var w = weights.unsafe_load[width=W](j)
+    var xv = SIMD[DType.float64, W](x)
+    var lxv = SIMD[DType.float64, W](log_x)
+    if mode == MODE_LOG:
+        var z = (lxv - mu) / sg
+        return -0.5 * z * z + log(w) - log(SQRT_2PI * sg * xv)
+    var z2 = (xv - mu) / sg
+    return -0.5 * z2 * z2 + log(w / (SQRT_2PI * sg))
+
+
+def logsumexp_row[mode: Int](
+    mus: FPtr,
+    weights: FPtr,
+    sigmas: FPtr,
+    k: Int,
+    x: Float64,
+) -> Float64:
+    """Return log(sum_j exp(term_j)) for one sample, SIMD over components.
+
+    The largest term is found first, then the exponentials are summed relative
+    to it, so nothing overflows and the terms are formed twice but exponentiated
+    once. Folding the two passes into one was measured slower at caller sizes:
+    a single fused pass has to exponentiate every component twice (once to fold
+    it into the running maximum), while the second maximum pass here only ever
+    builds cheap underflowing exponentials. Four accumulators keep the sum from
+    serialising on floating-point add latency.
+
+    Buffers are the contiguous NumPy arrays handed through the FFI, so the
+    W-lane loads start on the allocation's 16-byte boundary.
+    """
+    # log(x) is hoisted: the two-pass form below would otherwise recompute it
+    # once per component per pass.
+    var row_log_x = x
+    if mode == MODE_LOG:
+        row_log_x = log(x)
+    var floor = SIMD[DType.float64, W](-1.0e300)
+    var j = 0
+    var best = floor
+    while j + W <= k:
+        best = max(best, component_log_terms[mode](x, row_log_x, mus, weights, sigmas, j))
+        j += W
+    var max_term = best.reduce_max()
+    while j < k:
+        var term = normal_log_term(x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j])
+        if mode == MODE_LOG:
+            term = lognormal_log_term(x, row_log_x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j])
+        max_term = max(max_term, term)
+        j += 1
+    var top = SIMD[DType.float64, W](max_term)
+    var acc0 = SIMD[DType.float64, W](0.0)
+    var acc1 = acc0
+    var acc2 = acc0
+    var acc3 = acc0
+    j = 0
+    while j + 4 * W <= k:
+        acc0 += exp(component_log_terms[mode](x, row_log_x, mus, weights, sigmas, j) - top)
+        acc1 += exp(component_log_terms[mode](x, row_log_x, mus, weights, sigmas, j + W) - top)
+        acc2 += exp(component_log_terms[mode](x, row_log_x, mus, weights, sigmas, j + 2 * W) - top)
+        acc3 += exp(component_log_terms[mode](x, row_log_x, mus, weights, sigmas, j + 3 * W) - top)
+        j += 4 * W
+    while j + W <= k:
+        acc0 += exp(component_log_terms[mode](x, row_log_x, mus, weights, sigmas, j) - top)
+        j += W
+    var total = ((acc0 + acc1) + (acc2 + acc3)).reduce_add()
+    while j < k:
+        var term = normal_log_term(x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j])
+        if mode == MODE_LOG:
+            term = lognormal_log_term(x, row_log_x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j])
+        total += exp(term - max_term)
+        j += 1
+    return log(total) + max_term
 
 
 def clamp_sigmas(sigmas: FPtr, k: Int):
@@ -97,42 +189,9 @@ def gmm_lpdf(
     if not quantized:
         clamp_sigmas(sigmas, k)
         for i in range(n):
-            var x = samples[unsafe_offset=i]
-            var max_term = Float64(-1.0e300)
-            var j = 0
-            while j + LANES <= k:
-                var best01 = max(normal_log_term(x, mus[unsafe_offset=j + 0], weights[unsafe_offset=j + 0], sigmas[unsafe_offset=j + 0]), normal_log_term(x, mus[unsafe_offset=j + 1], weights[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]))
-                var best23 = max(normal_log_term(x, mus[unsafe_offset=j + 2], weights[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]), normal_log_term(x, mus[unsafe_offset=j + 3], weights[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]))
-                var best45 = max(normal_log_term(x, mus[unsafe_offset=j + 4], weights[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]), normal_log_term(x, mus[unsafe_offset=j + 5], weights[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]))
-                var best67 = max(normal_log_term(x, mus[unsafe_offset=j + 6], weights[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]), normal_log_term(x, mus[unsafe_offset=j + 7], weights[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]))
-                max_term = max(max_term, max(max(best01, best23), max(best45, best67)))
-                j += LANES
-            while j < k:
-                max_term = max(max_term, normal_log_term(x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]))
-                j += 1
-            var a0 = Float64(0.0)
-            var a1 = Float64(0.0)
-            var a2 = Float64(0.0)
-            var a3 = Float64(0.0)
-            var a4 = Float64(0.0)
-            var a5 = Float64(0.0)
-            var a6 = Float64(0.0)
-            var a7 = Float64(0.0)
-            j = 0
-            while j + LANES <= k:
-                a0 += exp(normal_log_term(x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]) - max_term)
-                a1 += exp(normal_log_term(x, mus[unsafe_offset=j + 1], weights[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]) - max_term)
-                a2 += exp(normal_log_term(x, mus[unsafe_offset=j + 2], weights[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]) - max_term)
-                a3 += exp(normal_log_term(x, mus[unsafe_offset=j + 3], weights[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]) - max_term)
-                a4 += exp(normal_log_term(x, mus[unsafe_offset=j + 4], weights[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]) - max_term)
-                a5 += exp(normal_log_term(x, mus[unsafe_offset=j + 5], weights[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]) - max_term)
-                a6 += exp(normal_log_term(x, mus[unsafe_offset=j + 6], weights[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]) - max_term)
-                a7 += exp(normal_log_term(x, mus[unsafe_offset=j + 7], weights[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]) - max_term)
-                j += LANES
-            while j < k:
-                a0 += exp(normal_log_term(x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]) - max_term)
-                j += 1
-            result[unsafe_offset=i] = log((((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)))) + max_term - log_p_accept
+            result[unsafe_offset=i] = logsumexp_row[MODE_GMM](
+                mus, weights, sigmas, k, samples[unsafe_offset=i]
+            ) - log_p_accept
         return
 
     for i in range(n):
@@ -273,43 +332,9 @@ def lgmm_lpdf(
     if not quantized:
         clamp_sigmas(sigmas, k)
         for i in range(n):
-            var x = samples[unsafe_offset=i]
-            var log_x = log(x)
-            var max_term = Float64(-1.0e300)
-            var j = 0
-            while j + LANES <= k:
-                var best01 = max(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 0], weights[unsafe_offset=j + 0], sigmas[unsafe_offset=j + 0]), lognormal_log_term(x, log_x, mus[unsafe_offset=j + 1], weights[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]))
-                var best23 = max(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 2], weights[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]), lognormal_log_term(x, log_x, mus[unsafe_offset=j + 3], weights[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]))
-                var best45 = max(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 4], weights[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]), lognormal_log_term(x, log_x, mus[unsafe_offset=j + 5], weights[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]))
-                var best67 = max(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 6], weights[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]), lognormal_log_term(x, log_x, mus[unsafe_offset=j + 7], weights[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]))
-                max_term = max(max_term, max(max(best01, best23), max(best45, best67)))
-                j += LANES
-            while j < k:
-                max_term = max(max_term, lognormal_log_term(x, log_x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]))
-                j += 1
-            var a0 = Float64(0.0)
-            var a1 = Float64(0.0)
-            var a2 = Float64(0.0)
-            var a3 = Float64(0.0)
-            var a4 = Float64(0.0)
-            var a5 = Float64(0.0)
-            var a6 = Float64(0.0)
-            var a7 = Float64(0.0)
-            j = 0
-            while j + LANES <= k:
-                a0 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]) - max_term)
-                a1 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 1], weights[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]) - max_term)
-                a2 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 2], weights[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]) - max_term)
-                a3 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 3], weights[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]) - max_term)
-                a4 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 4], weights[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]) - max_term)
-                a5 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 5], weights[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]) - max_term)
-                a6 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 6], weights[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]) - max_term)
-                a7 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 7], weights[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]) - max_term)
-                j += LANES
-            while j < k:
-                a0 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]) - max_term)
-                j += 1
-            result[unsafe_offset=i] = log((((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)))) + max_term
+            result[unsafe_offset=i] = logsumexp_row[MODE_LOG](
+                mus, weights, sigmas, k, samples[unsafe_offset=i]
+            )
         return
 
     for i in range(n):
@@ -452,6 +477,12 @@ def adaptive_parzen(
     while j < count:
         weights[unsafe_offset=j] /= total
         j += 1
+
+
+@export("mho_simd_width")
+def mho_simd_width() abi("C") -> Int:
+    """Float64 lane count of the compiled density kernels (tests size their tails by it)."""
+    return W
 
 
 @export("mho_gmm1_lpdf")
