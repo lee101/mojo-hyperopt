@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import subprocess
 from typing import Any
@@ -16,6 +17,10 @@ from .space import prior_distribution
 
 EPS = 1e-12
 DEFAULT_LF = 25
+# Density-kernel threading policy. The Mojo side repeats these numbers as a
+# floor and never starts more than PARALLEL_WORKERS threads; this side decides
+# how many to ask for (the host is shared, so it is capped well below its cores).
+PARALLEL_WORKERS = min(4, os.cpu_count() or 1)
 _default_prior_weight = 1.0
 _default_n_EI_candidates = 24
 _default_gamma = 0.25
@@ -197,6 +202,7 @@ def GMM1_lpdf(
         0.0 if q is None else float(q),
         int(q is not None),
         _lib.addr(result),
+        PARALLEL_WORKERS,
     )
     return result.reshape(original.shape)
 
@@ -264,6 +270,7 @@ def LGMM1_lpdf(
         0.0 if q is None else float(q),
         int(q is not None),
         _lib.addr(result),
+        PARALLEL_WORKERS,
     )
     return result.reshape(original.shape)
 

@@ -136,6 +136,99 @@ Summation order still differs from upstream in the last bits, so the parity
 tests keep their `rtol=1e-6, atol=3e-7` tolerances; against upstream the SIMD
 rows differ by at most 1.3e-8 absolute at the benchmark size.
 
+### Parallel phase
+
+The two unquantized density kernels — the only remaining single-core cost — now
+run their rows on up to four threads, but only above a measured size. The
+threading is in-kernel `parallelize` from `max.algorithm`; the `std.algorithm`
+and `std.threading` forms do not compile on this toolchain.
+
+| benchmark | before (serial rows) | after (threaded rows) | hyperopt 0.2.7 (after run) | speedup |
+| --- | ---: | ---: | ---: | ---: |
+| adaptive Parzen, 20k observations | 0.96 ms | 0.93 ms | 1.42 ms | 1.52x |
+| GMM log-density, 200k x 48 | 186.77 ms | 55.50 ms | 520.61 ms | 9.38x |
+| GMM log-density GPU, 200k x 48 | 218.70 ms | 95.32 ms | 357.79 ms | 3.75x |
+| quantized GMM log-mass, 100k x 32 | 66.00 ms | 81.42 ms | 241.80 ms | 2.97x |
+| log-GMM log-density, 200k x 48 | 337.47 ms | 77.39 ms | 564.96 ms | 7.30x |
+| categorical log-density, 5M | 38.75 ms | 32.52 ms | 68.41 ms | 2.10x |
+| annealing bounds, 5M centers | 11.21 ms | 8.51 ms | 46.99 ms | 5.52x |
+| TPE `fmin`, 200 cheap evaluations | 212.10 ms | 206.89 ms | 654.36 ms | 3.16x |
+| anneal `fmin`, 500 cheap evaluations | 478.74 ms | 451.74 ms | 869.42 ms | 1.92x |
+
+Both columns are `bench/bench.py` on the **same built library**, run back to
+back this session under the same file lock, with the load average near 23-25
+on the shared host. "Before" is the serial path with `tpe.PARALLEL_WORKERS = 1`
+forced (`bench/bench.py` does not expose that knob; importing the module, setting
+`tpe.PARALLEL_WORKERS = 1`, and then running `bench.py` with `runpy` reproduces
+it); "after" is the default. The two GMM rows are the whole effect. The
+other rows do not call the two density kernels and moved only by host noise:
+quantized GMM, categorical and annealing bounds are measured again below with
+the same serial/threaded pair, and Parzen and the two `fmin` runs are close
+enough to be called unchanged. TPE `fmin` at 200 evaluations barely moves
+because those calls (20 — 200 samples) are under the threshold and stay serial.
+
+Serial against threaded, measured directly on the same call (best of 15,
+isolated, `tpe.PARALLEL_WORKERS` toggled between runs):
+
+| kernel, size | serial | 8-thread pool (previous path) | threaded default |
+| --- | ---: | ---: | ---: |
+| `anneal_bounds`, 1M centers | 8.23 ms | 0.58 ms | 0.58 ms (unchanged pool) |
+| `anneal_bounds`, 5M centers | 63.53 ms | 14.46 ms | 14.46 ms (unchanged pool) |
+| `anneal_bounds`, 20M centers | 160.16 ms | 50.84 ms | 50.84 ms (unchanged pool) |
+
+`anneal_bounds` was already parallel before this phase (a Python slice pool
+above 1M centers) and is left exactly as it was: the parallel path was
+re-measured and it is 4.4x faster than one serial call, not slower, so there
+was nothing to revert. Its 8 workers are the memory-bound case where a slice
+split wins; converting it to in-kernel threads was not attempted.
+
+Thread scaling, same kernel, same input, best of 9 (isolated call through the
+FFI, `n` samples x `k = 48` components, load average ≈ 25 on a 36-core host):
+
+| k = 48 | 1 thread | 2 threads | 4 threads |
+| --- | ---: | ---: | ---: |
+| GMM, n = 8,192 | 6.63 ms | 6.70 ms | 6.48 ms |
+| GMM, n = 12,000 | 9.82 ms | 9.90 ms | 9.79 ms |
+| GMM, n = 16,384 | 13.47 ms | 12.26 ms | 11.61 ms |
+| GMM, n = 32,768 | 25.1 ms | 18.0 ms | 13.4 ms |
+| GMM, n = 65,536 | 51.8 ms | 31.4 ms | 21.6 ms |
+| GMM, n = 200,000 | 186.8 ms | 104.5 ms | 59.9 ms |
+| log-GMM, n = 200,000 | 337.5 ms | 129.6 ms | 70.4 ms |
+
+The crossover at `k = 48` is between 12k and 16k samples: at and below 12k the
+threads cost more than they save and the gain is flat (±1%), from 16k it grows
+with n. The threshold is therefore **16,384 samples and at least 393,216
+sample-component pairs** (so narrow mixtures stay serial at the crossover:
+`n = 16384, k = 48` is serial, `k = 96` is not), then four threads. The width
+guard is a measurement too: at the same `n = 131,072`, `k = 32` takes 74.5 ms
+serial and 31.3 ms on four threads, against 104.0 ms and 40.0 ms at `k = 48`,
+so the per-row cost is what sets the size gate, and a 16k-sample call with 48
+components (786k pairs) is left serial rather than threaded. 8 threads
+were measured too (31.3 ms at 200k against 32.9 ms for 4, and 19.0 against
+21.6 at 65k) — a few percent on a host that is 70% busy, which does not justify
+doubling the threads taken from other jobs, so the worker cap stays at 4 and
+stops at 2 until `n >= 4 x threshold`. At 4 threads the speedup flattens
+(3.3x at 200k, 3.4x at 65k) while 8 threads adds host contention, so that
+flattening is recorded rather than chased.
+
+How the split works: `parallelize` is handed one work item per **row block** of
+`16 x W` rows (128 samples at `W = 8`), not one per row. Blocks are whole
+multiples of `W`, so every worker's first SIMD load stays 16-byte aligned, and
+the block boundaries — not the worker count — decide which rows go where. The
+arithmetic per row is unchanged, so the threaded result is **bitwise identical**
+to the serial one; `tests/test_parallel.py` asserts `np.array_equal` (no
+tolerance) over both kernels at `n` = 16383, 16384, 16385 and 40001 samples,
+`k` = 1, 7 and 48, and 1, 2, 3, 4 and 8 requested workers, plus the exported
+`mho_parallel_workers` policy at its boundary sizes.
+
+| change | result |
+| --- | --- |
+| in-kernel `parallelize` for `gmm_lpdf` / `lgmm_lpdf` rows, threshold 16,384 samples, <= 4 workers | **kept**: 3.4x at 200k x 48 (GMM 186.8 → 55.5 ms, log-GMM 337.5 → 77.4 ms) |
+| same path at `n <= 12k` (k = 48), i.e. threading small calls | **not shipped**: 12k is flat (±1%), below it threads lose; the threshold sits above that with margin |
+| 8 workers instead of 4 | **not shipped**: +4-12% at 65k-200k on a 70%-busy host; not worth the extra cores |
+| `anneal_bounds` on the existing 8-thread Python slice pool (1M+ centers) | **kept as-is**: 14.5 ms vs 63.5 ms serial at 5M, 50.8 vs 160.2 ms at 20M — re-measured this session, it wins, so it was not reverted |
+
+
 Unbounded, unquantized GMM and log-GMM evaluation also accept `device="gpu"`.
 This is an explicit opt-in because transfers and device setup are not worthwhile
 for small inputs; CPU remains the default. The GPU path checks that at least

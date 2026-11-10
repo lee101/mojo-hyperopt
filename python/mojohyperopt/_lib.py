@@ -19,8 +19,8 @@ I = ctypes.c_int64
 F = ctypes.c_double
 
 _SIGNATURES = {
-    "mho_gmm1_lpdf": ([I, I, I, I, I, I, F, F, I, I, F, I, I], I),
-    "mho_lgmm1_lpdf": ([I, I, I, I, I, I, F, F, I, I, F, I, I], I),
+    "mho_gmm1_lpdf": ([I, I, I, I, I, I, F, F, I, I, F, I, I, I], I),
+    "mho_lgmm1_lpdf": ([I, I, I, I, I, I, F, F, I, I, F, I, I, I], I),
     "mho_gmm1_lpdf_gpu": ([I, I, I, I, I, I, I, I], I),
     "mho_adaptive_parzen_normal": (
         [I, I, F, F, F, I, I, I, I, I],
@@ -29,6 +29,7 @@ _SIGNATURES = {
     "mho_categorical_lpdf": ([I, I, I, I, I], I),
     "mho_anneal_bounds": ([I, I, F, F, F, I, I], I),
     "mho_simd_width": ([], I),
+    "mho_parallel_workers": ([I, I, I], I),
 }
 
 

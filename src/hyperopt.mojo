@@ -1,5 +1,7 @@
 """Numerical kernels for TPE density estimation and annealing proposals."""
 
+# Parallelism lives in `max` on this toolchain; the `std` forms do not compile.
+from max.algorithm import parallelize
 from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from std.math import erf, exp, log, sqrt
@@ -18,6 +20,25 @@ comptime LANES = 8
 comptime W = simd_width_of[DType.float64]()
 comptime MODE_GMM = 0
 comptime MODE_LOG = 1
+# Samples per thread: the density kernels are compute-bound at ~19 Mcomp/s on a
+# single core, so the smallest run worth starting threads for is the one where
+# each worker still gets enough rows to amortise its launch. Measured crossover
+# at k=48 is between 12k and 16k samples; the gate below is 16k with margin.
+comptime PARALLEL_MIN_SAMPLES = 16384
+# The host is shared. `choose_workers` therefore never hands out more than 4
+# workers, however many are requested; the larger constant is only a bound on
+# the request so the 1/2/4-thread split can be forced explicitly. A serial call
+# (1), the 2- and 4-thread prefixes of a larger pool and the capped value all
+# produce identical bytes, so nothing below depends on which value is picked.
+comptime PARALLEL_WORKERS_MAX = 32
+comptime PARALLEL_WORKERS_CAP = 4
+comptime PARALLEL_MIN_WORK = 393216
+# Each worker is handed whole blocks of BLOCK_ROWS_MULT x W rows. Block sizes
+# are multiples of W, so every worker's first SIMD load keeps 16-byte alignment,
+# and the block boundaries -- not the worker count -- decide which rows go where.
+# The block size is therefore part of the output contract: threaded and serial
+# calls produce bitwise-identical results for any worker count.
+comptime BLOCK_ROWS_MULT = 16
 
 def fp(addr: Int) -> FPtr:
     return FPtr(unsafe_from_address=addr)
@@ -143,6 +164,25 @@ def clamp_sigmas_addr(sigmas_addr: Int, k: Int):
     clamp_sigmas(FPtr(unsafe_from_address=sigmas_addr), k)
 
 
+def choose_workers(n: Int, k: Int, requested: Int) -> Int:
+    """Worker count for one call, independent of how many threads the runtime has.
+
+    A contract rather than a tuning knob: every build and every machine picks
+    the same split, which is what lets the serial and threaded results be
+    compared bitwise and keeps the test off the host's core count. Below
+    4 * PARALLEL_MIN_SAMPLES the request is only honoured at 1/2/4 (never more
+    than the call has blocks for); above it the 4-worker cap applies.
+    """
+    if n * k < PARALLEL_MIN_WORK:
+        return 1
+    var threads = min(requested, PARALLEL_WORKERS_MAX)
+    if n < PARALLEL_WORKERS_CAP * PARALLEL_MIN_SAMPLES:
+        # Only the 1/2/4 prefix of any larger request is honoured here.
+        threads = min(threads, PARALLEL_WORKERS_CAP)
+        threads = min(threads, n // PARALLEL_MIN_SAMPLES)
+    return max(1, min(threads, PARALLEL_WORKERS_CAP))
+
+
 def acceptance(
     weights: FPtr,
     mus: FPtr,
@@ -167,6 +207,28 @@ def acceptance(
     return total
 
 
+def gmm_lpdf_rows(
+    samples: FPtr,
+    weights: FPtr,
+    mus: FPtr,
+    sigmas: FPtr,
+    k: Int,
+    log_p_accept: Float64,
+    result: FPtr,
+    first: Int,
+    last: Int,
+):
+    """Rows `first:last` of the unquantized GMM log-density.
+
+    A whole-row function so the serial call and every parallel worker run the
+    identical per-row arithmetic; splitting here cannot change a single bit.
+    """
+    for i in range(first, last):
+        result[unsafe_offset=i] = logsumexp_row[MODE_GMM](
+            mus, weights, sigmas, k, samples[unsafe_offset=i]
+        ) - log_p_accept
+
+
 def gmm_lpdf(
     samples: FPtr,
     n: Int,
@@ -181,6 +243,7 @@ def gmm_lpdf(
     q: Float64,
     quantized: Bool,
     result: FPtr,
+    workers: Int,
 ):
     var p_accept = acceptance(
         weights, mus, sigmas, k, low, high, has_low, has_high
@@ -188,10 +251,25 @@ def gmm_lpdf(
     var log_p_accept = log(p_accept)
     if not quantized:
         clamp_sigmas(sigmas, k)
-        for i in range(n):
-            result[unsafe_offset=i] = logsumexp_row[MODE_GMM](
-                mus, weights, sigmas, k, samples[unsafe_offset=i]
-            ) - log_p_accept
+        # Blocks are whole multiples of W rows, so every worker's first SIMD
+        # load keeps the 16-byte alignment the W-lane loads rely on.
+        var block_rows = BLOCK_ROWS_MULT * W
+        var blocks = (n + block_rows - 1) // block_rows
+        var kern = k
+        var rows = n
+        var lpa = log_p_accept
+        var step = block_rows
+        var count = blocks
+        if workers <= 1 or blocks <= 1:
+            gmm_lpdf_rows(samples, weights, mus, sigmas, k, log_p_accept, result, 0, n)
+            return
+        def run_block(block: Int) {imm}:
+            var start = block * step
+            gmm_lpdf_rows(
+                samples, weights, mus, sigmas, kern, lpa, result,
+                start, min(start + step, rows),
+            )
+        parallelize(run_block, count, workers)
         return
 
     for i in range(n):
@@ -310,6 +388,23 @@ def lognormal_cdf(x: Float64, mu: Float64, sigma: Float64) -> Float64:
     return 0.5 + 0.5 * erf((log(x if x > EPS else EPS) - mu) / denom)
 
 
+def lgmm_lpdf_rows(
+    samples: FPtr,
+    weights: FPtr,
+    mus: FPtr,
+    sigmas: FPtr,
+    k: Int,
+    result: FPtr,
+    first: Int,
+    last: Int,
+):
+    """Rows `first:last` of the unquantized log-GMM log-density (no jacobian)."""
+    for i in range(first, last):
+        result[unsafe_offset=i] = logsumexp_row[MODE_LOG](
+            mus, weights, sigmas, k, samples[unsafe_offset=i]
+        )
+
+
 def lgmm_lpdf(
     samples: FPtr,
     n: Int,
@@ -324,6 +419,7 @@ def lgmm_lpdf(
     q: Float64,
     quantized: Bool,
     result: FPtr,
+    workers: Int,
 ):
     var p_accept = acceptance(
         weights, mus, sigmas, k, low, high, has_low, has_high
@@ -331,10 +427,22 @@ def lgmm_lpdf(
     var log_p_accept = log(p_accept)
     if not quantized:
         clamp_sigmas(sigmas, k)
-        for i in range(n):
-            result[unsafe_offset=i] = logsumexp_row[MODE_LOG](
-                mus, weights, sigmas, k, samples[unsafe_offset=i]
+        var block_rows = BLOCK_ROWS_MULT * W
+        var blocks = (n + block_rows - 1) // block_rows
+        var kern = k
+        var rows = n
+        var step = block_rows
+        var count = blocks
+        if workers <= 1 or blocks <= 1:
+            lgmm_lpdf_rows(samples, weights, mus, sigmas, k, result, 0, n)
+            return
+        def run_block(block: Int) {imm}:
+            var start = block * step
+            lgmm_lpdf_rows(
+                samples, weights, mus, sigmas, kern, result,
+                start, min(start + step, rows),
             )
+        parallelize(run_block, count, workers)
         return
 
     for i in range(n):
@@ -485,6 +593,12 @@ def mho_simd_width() abi("C") -> Int:
     return W
 
 
+@export("mho_parallel_workers")
+def mho_parallel_workers(n: Int, k: Int, requested: Int) abi("C") -> Int:
+    """Workers the density kernels would use for this size (1 means serial)."""
+    return choose_workers(n, k, requested)
+
+
 @export("mho_gmm1_lpdf")
 def mho_gmm1_lpdf(
     samples_addr: Int,
@@ -500,6 +614,7 @@ def mho_gmm1_lpdf(
     q: Float64,
     quantized: Int,
     result_addr: Int,
+    workers: Int,
 ) abi("C") -> Int:
     if n < 0 or k <= 0 or weights_addr == 0 or mus_addr == 0 or sigmas_addr == 0:
         return 0
@@ -519,6 +634,7 @@ def mho_gmm1_lpdf(
         q,
         quantized != 0,
         fp(result_addr),
+        choose_workers(n, k, workers),
     )
     return 1
 
@@ -538,6 +654,7 @@ def mho_lgmm1_lpdf(
     q: Float64,
     quantized: Int,
     result_addr: Int,
+    workers: Int,
 ) abi("C") -> Int:
     if n < 0 or k <= 0 or weights_addr == 0 or mus_addr == 0 or sigmas_addr == 0:
         return 0
@@ -557,6 +674,7 @@ def mho_lgmm1_lpdf(
         q,
         quantized != 0,
         fp(result_addr),
+        choose_workers(n, k, workers),
     )
     return 1
 
