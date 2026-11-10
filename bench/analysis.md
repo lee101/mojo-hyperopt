@@ -29,7 +29,7 @@ AVX2-only, so peak FLOPs assumed = 16 flops/cycle/call x ~2.0 GHz effective x 36
 | --- | ---: | ---: | ---: |
 | adaptive Parzen, 20k observations | 1.16 ms | 1.61 ms | 1.39x |
 | GMM log-density, 200k x 48 | 510.55 ms | 521.46 ms | 1.02x |
-| GMM log-density GPU, 200k x 48 | 30.05 ms | 520.65 ms | 17.33x |
+| GMM log-density GPU, 200k x 48 | 30.05 ms | 520.65 ms | 17.33x (CPU fallback; see VERIFY note in §5) |
 | quantized GMM log-mass, 100k x 32 | 113.12 ms | 220.29 ms | 1.95x |
 | log-GMM log-density, 200k x 48 | 569.58 ms | 751.60 ms | 1.32x |
 | categorical log-density, 5M | 50.00 ms | 92.87 ms | 1.86x |
@@ -89,7 +89,7 @@ Ranked by time per call. Bytes/flops are per call, derived from the loop structu
 | -: | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
 | 1 | `gmm_lpdf` (unquantized) | 200k x 48 | 499.6 ms | 9.6M comp x 16 B = 153.6 MB (+3x per-row rescan of w/m/s: 34.6 MB) = 188.2 MB | 76.8M log-exp pairs = ~1.2 Gflop | 6.4 | **compute-bound** | kernel `exp`/`log` calls: 19 Mcomp/s (1.9% of 1.15 Tflop/s) | no (tied, 1.03x) | **unroll** then **simd** |
 | 2 | `lgmm_lpdf` (unquantized) | 200k x 48 | 583.4 ms | 188.2 MB | ~1.2 Gflop + 19.2M extra `log` | ~6.4 | **compute-bound** | kernel: `log(samples[i])` recomputed 2x K times per row | no (1.32x) | **unroll** (hoist the per-row `log`), then **simd** |
-| 3 | `GMM1_lpdf`, device="gpu" | 200k x 48 | 30.05 ms | 1.6 MB in + 23 KB params + 1.6 MB out = 3.2 MB H2D/D2H | ~1.2 Gflop | 375 | compute-bound, moving on PCIe | host: 1 launch + 2 node-built contexts are 5.4x faster than CPU | no (17.33x) | **none** for this size; **gpu** worth it only for n >= ~1M |
+| 3 | `GMM1_lpdf`, device="gpu" | 200k x 48 | 30.05 ms | 1.6 MB in + 23 KB params + 1.6 MB out = 3.2 MB H2D/D2H | ~1.2 Gflop | 375 | compute-bound, moving on PCIe | host: 1 launch + 2 node-built contexts are 5.4x faster than CPU | **VERIFY: this row was the CPU fallback**, not the device; a real warm device call is 1.42 ms at this size | **none** for this size; **gpu** worth it only for n >= ~1M |
 | 4 | quantized `gmm_lpdf` | 100k x 32 | 114.7 ms | 3.2M comp x 16 B = 51.2 MB | 3.2M x 2 erfc = 25.6M special fns | 0.5 | **compute-bound** (`erf`) | kernel: 28 Mcomp/s | no (1.95x) | **unroll** (paired CDF), **simd** rejected (see §6) |
 
 ### 4b. Vector / reduction kernels
@@ -139,7 +139,7 @@ Flat 0.019 Gcomp/s across 4 < k < 192 is the tell: no block-level reuse, no vect
 
 | kernel | measured flops/byte | GPU worth it? | reason |
 | --- | ---: | --- | --- |
-| unquantized `gmm_lpdf` (row 1) | **6.4** | yes, above the ~2 flop/B rule, but only for large n | already ships and wins 17.33x at 200k; below ~100k the 30 ms launch+transfer floor dominates |
+| unquantized `gmm_lpdf` (row 1) | **6.4** | yes, above the ~2 flop/B rule, but only for large n | **corrected in VERIFY**: the "17.33x at 200k" row in §1 was a CPU-fallback measurement, not a device one. A real warm device call is ~1.4 ms against 57 ms of CPU at 200k (about 40x), but the first call in a process costs 274-449 ms, so the device only wins from ~n = 20,000 up on warm calls. See `bench/verify.md`. |
 | unquantized `lgmm_lpdf` (row 2) | **~6.4** | no new GPU work | the same kernel shape as row 1 already has a GPU twin (`log_space=1` path in `mho_gmm1_lpdf_gpu`); nothing to add |
 | quantized `gmm_lpdf` (row 4) | **0.5** | **no** | 0.5 flops/byte < 2; the 51.2 MB working set streams from L2 faster than a copy to device |
 | `categorical_lpdf` (row 5) | **0.1** | **no** | 0.1 flops/byte, gather-latency bound; 95 MB of traffic would cost ~2 x 1.6 MiB per-job copy for negligible compute |
@@ -190,7 +190,7 @@ Checked all six call sites in `python/mojohyperopt/`.
 | --- | --- | --- |
 | adaptive Parzen 20k | no | 1.39x; kernel is 150 us against a 748 us sort |
 | GMM log-density 200k x 48 | no / **tied** | 1.02x vs a stale README claim of 0.85x |
-| GMM GPU | no | 17.33x |
+| GMM GPU | no | 17.33x in §1, but that row fell back to the CPU (VERIFY correction); a warm device call is ~40x, a cold first call is a large loss |
 | quantized GMM 100k x 32 | no | 1.95x |
 | log-GMM 200k x 48 | no | 1.32x |
 | categorical 5M | no | 1.86x, but 58% of the 35.5 ms is validation, not the kernel |

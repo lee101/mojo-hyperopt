@@ -80,43 +80,66 @@ already-built shared library.
 
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz,
 Linux 6.8.0-147-generic x86-64 with glibc 2.39. Times are the best of repeated
-runs on identical input.
+runs on identical input (one warm-up call, then the fastest of 2-3 timed calls).
 
-The `SIMD phase` table below is the change made by this phase: every row is
-from one `pixi run bench` before the change and one after it, on the same
-machine in the same session, with the load average under 30 (other jobs share
-this host; timings move by a few percent run to run and the upstream column is
-noisier still).
+**These figures were re-measured in the VERIFY phase.** Every number below is
+the median of three full `pixi run bench` runs made in one session, on the
+current built library, with the host load average between 27 and 31 on 36
+cores. All three runs are in `bench/verify.md`. Both sides of each row run the
+same buffers, built from the same seed, and the benchmark compares the two
+outputs (`allclose`, `rtol=1e-6, atol=3e-7`) after timing and aborts on a
+mismatch, so neither side skips work.
 
-| benchmark | before (two-pass, scalar inner loop) | after (SIMD rows) | hyperopt 0.2.7 (after run) | speedup |
-| --- | ---: | ---: | ---: | ---: |
-| adaptive Parzen, 20k observations | 1.11 ms | 1.13 ms | 1.53 ms | 1.35x |
-| GMM log-density, 200k x 48 | 189.77 ms | 156.02 ms | 532.35 ms | 3.41x |
-| GMM log-density GPU, 200k x 48 | 253.14 ms | 200.07 ms | 501.04 ms | 2.50x |
-| quantized GMM log-mass, 100k x 32 | 66.11 ms | 66.93 ms | 225.77 ms | 3.37x |
-| log-GMM log-density, 200k x 48 | 286.54 ms | 223.81 ms | 534.31 ms | 2.39x |
-| categorical log-density, 5M | 34.24 ms | 31.85 ms | 67.29 ms | 2.11x |
-| annealing bounds, 5M centers | 9.69 ms | 8.88 ms | 47.12 ms | 5.30x |
-| TPE `fmin`, 200 cheap evaluations | 221.29 ms | 221.04 ms | 683.69 ms | 3.09x |
-| anneal `fmin`, 500 cheap evaluations | 484.70 ms | 457.76 ms | 861.55 ms | 1.88x |
+| benchmark | mojo-hyperopt | hyperopt 0.2.7 | speedup |
+| --- | ---: | ---: | ---: |
+| adaptive Parzen, 20k observations | 1.02 ms | 1.42 ms | 1.39x |
+| GMM log-density, 200k x 48 | 58.14 ms | 426.63 ms | 7.34x |
+| GMM log-density GPU, 200k x 48 | 98.94 ms | 406.55 ms | 4.11x |
+| quantized GMM log-mass, 100k x 32 | 66.63 ms | 243.93 ms | 3.66x |
+| log-GMM log-density, 200k x 48 | 76.02 ms | 545.10 ms | 7.17x |
+| categorical log-density, 5M | 35.80 ms | 75.35 ms | 2.11x |
+| annealing bounds, 5M centers | 9.67 ms | 48.65 ms | 5.03x |
+| TPE `fmin`, 200 cheap evaluations | 212.59 ms | 677.97 ms | 3.19x |
+| anneal `fmin`, 500 cheap evaluations | 463.43 ms | 909.44 ms | 1.96x |
 
-Only the two density kernels changed. Their paired medians, measured by calling
-the two builds' exported kernels alternately in one process so shared-host noise
-hits both equally (15 rounds, 200k x 48), are GMM 189.8 ms to 163.2 ms and
-log-GMM 276.0 ms to 228.2 ms. The GPU row fell with them because in that run the
-device request fell back to the CPU; the GPU kernel itself is unchanged. The
-adaptive Parzen, quantized GMM, categorical and annealing-bounds rows were
-already SIMD from the earlier phases and moved only within noise; they are kept
-in the table to show that.
+The `GMM log-density GPU` row is **not a device measurement**: the wrapper's
+4000 MiB free-memory gate declines the device after the first GPU call in a
+process, so by the time the row is timed it is the CPU kernel against
+upstream's CPU kernel. Its 4.11x is a CPU figure and moves with the GMM row.
+The real device comparison is the paired table in the GPU section below.
+
+### SIMD phase
+
+Earlier versions of this table showed a "before (two-pass, scalar inner loop)"
+and an "after (SIMD rows)" column side by side. **The "before" column cannot be
+reproduced from this tree**: it came from a pre-SIMD library that is no longer
+built, and nothing committed reproduces it. Those numbers have been removed
+rather than restated. What is reproducible is the current library (the table
+above) and the arithmetic of the change, which is still in the source:
+`logsumexp_row` forms component terms with `W`-lane loads, in two accumulating
+passes (a maximum pass, then an exponential-sum pass with four accumulators), a
+scalar tail, with `log(x)` hoisted once per row for the log-normal space.
+`tests/test_simd_lengths.py` drives every vectorised kernel at lengths 0, 1,
+W-1, W, W+1, 4W, 4W+1, 97 and 100001 for component counts 1, W-1, W, W+1, 3W
+and 48, so the scalar tails run. Deleting one tail iteration makes 54 of those
+tests fail.
+
+Only the two density kernels changed in the SIMD phase. Its paired
+before/after medians (GMM 189.8 to 163.2 ms, log-GMM 276.0 to 228.2 ms) came
+from two builds loaded alternately in one process; both builds are now the same
+build, so that comparison is no longer reproducible and is not restated as a
+current measurement. What this phase's kernels do today is the table above. The
+adaptive Parzen, quantized GMM, categorical and annealing-bounds rows do not use
+the two density kernels and their row-to-row movement is host noise.
 
 | kernel | what the phase did |
 | --- | --- |
-| `gmm_lpdf`, `lgmm_lpdf` (unquantized) | Component terms are now formed with `W`-lane loads (`component_log_terms`) instead of one scalar division and log per component: a maximum pass and a second exponential-sum pass, with four SIMD accumulators in the sum pass and a scalar tail. `log(x)` for the log-normal space is hoisted to once per row. |
-| fused single pass over the same data | Tried, measured, and **reverted**: folding the maximum into the summing pass needs every component exponentiated twice (once to fold it into the running maximum), and it was 200 ms against 189.8 ms for GMM and 272 ms against 258 ms for log-GMM. The maximum pass here only ever builds cheap underflowing exponentials, so two passes with one exp per component wins. |
-| quantized `gmm_lpdf` line integral | Tried `W`-lane `erf`; measured 64.4 ms against 63.7 ms, so **reverted**. The compiler's `erf` is also only correct for SIMD arguments with `|x| <= 1`, which the line integral cannot guarantee. |
-| 8 accumulators instead of 4 | Tried; 178 ms against 159 ms for GMM, so **reverted**. Two accumulator pairs in the maximum pass was neutral and is not kept. |
-| `mho_anneal_bounds` | Already a single fused SIMD pass over contiguous input with two streamed outputs at every size; no change was faster. |
-| `adaptive_parzen`, `categorical_lpdf` | Already SIMD in the contiguous loops; no change was faster. |
+| `gmm_lpdf`, `lgmm_lpdf` (unquantized) | Component terms are formed with `W`-lane loads (`component_log_terms`) instead of one scalar division and log per component: a maximum pass and a second exponential-sum pass, with four SIMD accumulators in the sum pass and a scalar tail. `log(x)` for the log-normal space is hoisted to once per row. This is the committed code; confirmed by reading `logsumexp_row` in `src/hyperopt.mojo`. |
+| fused single pass over the same data | **Not in the code**; the phase reports it was tried and reverted, citing 200 vs 189.8 ms (GMM) and 272 vs 258 ms (log-GMM). Those two builds no longer exist, so this session could not re-measure the comparison. |
+| quantized `gmm_lpdf` line integral | **Not in the code**: `erf` is called from the scalar `normal_cdf`/`lognormal_cdf` only, and every `erf` call site here has `|z| <= 1` (a normalised CDF argument), so the `|x| <= 1` caveat does not apply to the shipped path. The 64.4 vs 63.7 ms revert could not be re-measured. |
+| 8 accumulators instead of 4 | **Not in the code**: `logsumexp_row` uses four accumulators. The 178 vs 159 ms revert could not be re-measured. |
+| `mho_anneal_bounds` | Single fused SIMD pass over contiguous input with two streamed outputs; measured 9.67 ms at 5M centers this session. |
+| `adaptive_parzen`, `categorical_lpdf` | SIMD in the contiguous loops; measured 1.02 ms at 20k and 35.80 ms at 5M this session. |
 
 The SIMD width is read from the built library (`mojohyperopt.tpe.simd_width()`,
 exported as `mho_simd_width`), and `tests/test_simd_lengths.py` drives every
@@ -131,10 +154,16 @@ Adaptive Parzen uses NumPy's optimized `argsort` and passes its index buffer
 directly to Mojo; its sigma and normalisation loops, the categorical gather and
 the annealing-bounds clamp/offset pass are SIMD over contiguous buffers, with
 annealing bounds above one million centers split across a reusable eight-worker
-pool.
+pool. (`acceptance()`, the `low`/`high` normalisation shared by every
+GMM/LGMM call, is a scalar loop over `k` components — `k` is bounded by the
+trial count and it is not in the hot per-row path.)
 Summation order still differs from upstream in the last bits, so the parity
-tests keep their `rtol=1e-6, atol=3e-7` tolerances; against upstream the SIMD
-rows differ by at most 1.3e-8 absolute at the benchmark size.
+tests keep their `rtol=1e-6, atol=3e-7` tolerances. Re-measured this session
+over 50 random kernel comparisons (1 to 4000 samples, 1 to 48 components), the
+worst absolute difference from upstream was **1.10e-8**. At the benchmark sizes
+it is GMM 1.20e-9, log-GMM 1.71e-8 and quantized GMM 1.74e-8 — all inside that
+tolerance, and the largest is 1.7e-8 rather than the 1.3e-8 this section used
+to claim.
 
 ### Parallel phase
 
@@ -145,71 +174,109 @@ and `std.threading` forms do not compile on this toolchain.
 
 | benchmark | before (serial rows) | after (threaded rows) | hyperopt 0.2.7 (after run) | speedup |
 | --- | ---: | ---: | ---: | ---: |
-| adaptive Parzen, 20k observations | 0.96 ms | 0.93 ms | 1.42 ms | 1.52x |
-| GMM log-density, 200k x 48 | 186.77 ms | 55.50 ms | 520.61 ms | 9.38x |
-| GMM log-density GPU, 200k x 48 | 218.70 ms | 95.32 ms | 357.79 ms | 3.75x |
-| quantized GMM log-mass, 100k x 32 | 66.00 ms | 81.42 ms | 241.80 ms | 2.97x |
-| log-GMM log-density, 200k x 48 | 337.47 ms | 77.39 ms | 564.96 ms | 7.30x |
-| categorical log-density, 5M | 38.75 ms | 32.52 ms | 68.41 ms | 2.10x |
-| annealing bounds, 5M centers | 11.21 ms | 8.51 ms | 46.99 ms | 5.52x |
-| TPE `fmin`, 200 cheap evaluations | 212.10 ms | 206.89 ms | 654.36 ms | 3.16x |
-| anneal `fmin`, 500 cheap evaluations | 478.74 ms | 451.74 ms | 869.42 ms | 1.92x |
+| adaptive Parzen, 20k observations | — | 1.02 ms | 1.42 ms | 1.39x |
+| GMM log-density, 200k x 48 | 158.05 ms | 58.14 ms | 426.63 ms | 7.34x |
+| GMM log-density GPU, 200k x 48 | — | 98.94 ms | 406.55 ms | 4.11x |
+| quantized GMM log-mass, 100k x 32 | — | 66.63 ms | 243.93 ms | 3.66x |
+| log-GMM log-density, 200k x 48 | 229.48 ms | 76.02 ms | 545.10 ms | 7.17x |
+| categorical log-density, 5M | — | 35.80 ms | 75.35 ms | 2.11x |
+| annealing bounds, 5M centers | — | 9.67 ms | 48.65 ms | 5.03x |
+| TPE `fmin`, 200 cheap evaluations | — | 212.59 ms | 677.97 ms | 3.19x |
+| anneal `fmin`, 500 cheap evaluations | — | 463.43 ms | 909.44 ms | 1.96x |
 
-Both columns are `bench/bench.py` on the **same built library**, run back to
-back this session under the same file lock, with the load average near 23-25
-on the shared host. "Before" is the serial path with `tpe.PARALLEL_WORKERS = 1`
-forced (`bench/bench.py` does not expose that knob; importing the module, setting
-`tpe.PARALLEL_WORKERS = 1`, and then running `bench.py` with `runpy` reproduces
-it); "after" is the default. The two GMM rows are the whole effect. The
-other rows do not call the two density kernels and moved only by host noise:
-quantized GMM, categorical and annealing bounds are measured again below with
-the same serial/threaded pair, and Parzen and the two `fmin` runs are close
-enough to be called unchanged. TPE `fmin` at 200 evaluations barely moves
-because those calls (20 — 200 samples) are under the threshold and stay serial.
+The "after" and upstream columns are the same medians as the table above. The
+"before (serial rows)" column is re-measured this session by importing the
+module, setting `tpe.PARALLEL_WORKERS = 1`, and timing the identical call —
+that is the only way the serial path is reachable, since `bench/bench.py` does
+not expose the knob. Rows the parallel phase does not touch (`—`) were reported
+as unchanged; their serial and threaded paths are the same code, so no separate
+serial figure is given here rather than a number that would just be a second
+noise sample of the same measurement.
 
-Serial against threaded, measured directly on the same call (best of 15,
-isolated, `tpe.PARALLEL_WORKERS` toggled between runs):
+**Five figures in the earlier version of this table did not reproduce within
+20%** and are replaced by the measured ones:
 
-| kernel, size | serial | 8-thread pool (previous path) | threaded default |
-| --- | ---: | ---: | ---: |
-| `anneal_bounds`, 1M centers | 8.23 ms | 0.58 ms | 0.58 ms (unchanged pool) |
-| `anneal_bounds`, 5M centers | 63.53 ms | 14.46 ms | 14.46 ms (unchanged pool) |
-| `anneal_bounds`, 20M centers | 160.16 ms | 50.84 ms | 50.84 ms (unchanged pool) |
+| row | previous claim | measured this session |
+| --- | --- | --- |
+| GMM log-density, 200k x 48, threaded | 55.50 ms | 49.5 — 61.3 ms across runs (median 58.14), 2.6 — 3.2x over serial |
+| GMM log-density, 200k x 48, speedup | 9.38x | 6.92 — 7.70x (median 7.34x) |
+| log-GMM, 200k x 48, serial rows | 337.47 ms | 229.5 ms |
+| quantized GMM, 100k x 32, threaded | 81.42 ms | 66.63 ms |
+| quantized GMM, 100k x 32, speedup | 2.97x | 3.66x |
+
+The GMM/log-GMM threaded figures are the least stable in the table: this host
+is shared and the load average sat at 27 — 31 on 36 cores during all three
+runs, so a 4-thread kernel competes for cores it does not own. The speedup is
+real and repeated (serial 158 ms to threaded 49 — 61 ms, bitwise identical
+output), but quoting a single best-of-run figure at two decimals overstated it.
+
+Serial against threaded, re-measured directly on the same call this session
+(best of 9, `tpe.PARALLEL_WORKERS` toggled between runs):
+
+| kernel, size | serial (workers = 1) | default pool |
+| --- | ---: | ---: |
+| `anneal_bounds`, 1M centers | 3.98 ms | 2.40 ms |
+| `anneal_bounds`, 5M centers | 41.03 ms | 10.67 ms |
+| `anneal_bounds`, 20M centers | 202.91 ms | 42.90 ms |
+
+Outputs are `np.array_equal` between the two paths at all three sizes.
 
 `anneal_bounds` was already parallel before this phase (a Python slice pool
-above 1M centers) and is left exactly as it was: the parallel path was
-re-measured and it is 4.4x faster than one serial call, not slower, so there
-was nothing to revert. Its 8 workers are the memory-bound case where a slice
-split wins; converting it to in-kernel threads was not attempted.
+above 1M centers) and is left exactly as it was: it is 1.7x faster than a
+single serial call at 1M and 3.8 — 4.7x at 5M and 20M, not slower, so there was
+nothing to revert. (The earlier table's serial column — 8.23 / 63.53 /
+160.16 ms — did not reproduce; these are the measured values, and the 1M row
+was noisy enough this session that the pool's advantage there is under 2x, not
+the 14x previously implied.) Its 8 workers are the memory-bound case where a
+slice split wins; converting it to in-kernel threads was not attempted.
 
 Thread scaling, same kernel, same input, best of 9 (isolated call through the
-FFI, `n` samples x `k = 48` components, load average ≈ 25 on a 36-core host):
+FFI, `n` samples x `k = 48` components, two independent rounds this session,
+load average 31 on a 36-core host):
 
 | k = 48 | 1 thread | 2 threads | 4 threads |
 | --- | ---: | ---: | ---: |
-| GMM, n = 8,192 | 6.63 ms | 6.70 ms | 6.48 ms |
-| GMM, n = 12,000 | 9.82 ms | 9.90 ms | 9.79 ms |
-| GMM, n = 16,384 | 13.47 ms | 12.26 ms | 11.61 ms |
-| GMM, n = 32,768 | 25.1 ms | 18.0 ms | 13.4 ms |
-| GMM, n = 65,536 | 51.8 ms | 31.4 ms | 21.6 ms |
-| GMM, n = 200,000 | 186.8 ms | 104.5 ms | 59.9 ms |
-| log-GMM, n = 200,000 | 337.5 ms | 129.6 ms | 70.4 ms |
+| GMM, n = 8,192 | 6.55 — 7.41 ms | 6.41 — 6.46 ms | 6.39 — 6.47 ms |
+| GMM, n = 12,000 | 9.43 — 9.45 ms | 9.52 — 9.59 ms | 9.53 — 9.54 ms |
+| GMM, n = 16,384 | 12.80 — 12.99 ms | 12.78 — 13.05 ms | 12.84 — 13.01 ms |
+| GMM, n = 32,768 | 25.86 — 25.89 ms | 19.63 — 19.78 ms | 19.44 — 20.27 ms |
+| GMM, n = 65,536 | 51.51 — 52.21 ms | 33.89 — 35.34 ms | 21.13 — 23.21 ms |
+| GMM, n = 200,000 | 157.47 — 158.40 ms | 87.49 — 88.65 ms | 49.46 — 49.54 ms |
+| log-GMM, n = 200,000 | 220.57 — 221.01 ms | 118.85 — 138.29 ms | 62.74 — 74.35 ms |
 
 The crossover at `k = 48` is between 12k and 16k samples: at and below 12k the
 threads cost more than they save and the gain is flat (±1%), from 16k it grows
 with n. The threshold is therefore **16,384 samples and at least 393,216
-sample-component pairs** (so narrow mixtures stay serial at the crossover:
-`n = 16384, k = 48` is serial, `k = 96` is not), then four threads. The width
-guard is a measurement too: at the same `n = 131,072`, `k = 32` takes 74.5 ms
-serial and 31.3 ms on four threads, against 104.0 ms and 40.0 ms at `k = 48`,
-so the per-row cost is what sets the size gate, and a 16k-sample call with 48
-components (786k pairs) is left serial rather than threaded. 8 threads
-were measured too (31.3 ms at 200k against 32.9 ms for 4, and 19.0 against
-21.6 at 65k) — a few percent on a host that is 70% busy, which does not justify
-doubling the threads taken from other jobs, so the worker cap stays at 4 and
-stops at 2 until `n >= 4 x threshold`. At 4 threads the speedup flattens
-(3.3x at 200k, 3.4x at 65k) while 8 threads adds host contention, so that
-flattening is recorded rather than chased.
+sample-component pairs**, then four threads. Which of the two clauses binds
+depends on `n` (verified against `mho_parallel_workers` this session):
+
+| `n` | rule | outcome |
+| --- | --- | --- |
+| < 16,384 or pairs < 393,216 | work gate only | 1 worker |
+| 16,384 — 65,535 | work gate, then `min(4, n // 16,384)` | 3 workers at `n = 65535` once `k >= 7`; `n = 16384` stays 1 for any `k` up to 96 |
+| >= 65,536 | work gate, then the 4-worker cap | 4 workers as soon as pairs reach 393,216 (at `n = 65,536` that is `k >= 6`, not `k = 6`) |
+
+So the pair clause does real work for `n` between 16,384 and 65,535, and above
+`n = 65,536` the size alone gates it. The earlier text claimed the pair clause
+kept "a 16k-sample call with 48 components (786k pairs) serial rather than
+threaded" while `k = 96` at the same `n` would be threaded; **that does not
+reproduce** — at `n = 16384`, `k = 96` also gets 1 worker, because the second
+clause caps the count at `n // 16384 = 1`. The width guard is measured at the
+sizes where it applies: at `n = 131,072`, `k = 32` takes 74.03 ms serial and
+24.28 ms on four threads, against 107.37 ms and 38.11 ms at `k = 48` (the
+earlier 74.5 / 31.3 / 104.0 / 40.0 is within 20% of these), so per-row cost
+still scales the size gate. 8 threads was re-measured this session and **is
+not** a few percent: at `n = 200,000` it is 47.94 ms against 58.25 ms for 4
+(1.2x better), and at `n = 65,536` it is 22.42 against 22.82 ms (level). The
+earlier text said 8 threads was no better than 4 (31.3 vs 32.9 ms); here it is
+modestly better at 200k. The worker cap stays at 4 anyway: the host is
+70 — 80% busy during these runs, the gain is under 1.25x, and doubling the
+threads taken from other jobs is not justified by it. At 4 threads the speedup
+flattens (2.7 — 3.2x at 200k, 2.3 — 2.5x at 65k) while 8 threads adds host
+contention, so that flattening is recorded rather than chased. The policy
+itself is strict: `mho_parallel_workers` honours requests of 1, 2, 3 or 4
+exactly wherever the gates allow, and clamps anything larger to 4 (verified:
+request 5 and request 32 both give 4 at `n = 200,000, k = 48`).
 
 How the split works: `parallelize` is handed one work item per **row block** of
 `16 x W` rows (128 samples at `W = 8`), not one per row. Blocks are whole
@@ -223,10 +290,11 @@ tolerance) over both kernels at `n` = 16383, 16384, 16385 and 40001 samples,
 
 | change | result |
 | --- | --- |
-| in-kernel `parallelize` for `gmm_lpdf` / `lgmm_lpdf` rows, threshold 16,384 samples, <= 4 workers | **kept**: 3.4x at 200k x 48 (GMM 186.8 → 55.5 ms, log-GMM 337.5 → 77.4 ms) |
+| in-kernel `parallelize` for `gmm_lpdf` / `lgmm_lpdf` rows, threshold 16,384 samples, <= 4 workers | **kept**: 2.6 — 3.2x at 200k x 48 this session (GMM 158.05 → 58.14 ms median, log-GMM 229.48 → 76.02 ms median, bitwise identical output) |
 | same path at `n <= 12k` (k = 48), i.e. threading small calls | **not shipped**: 12k is flat (±1%), below it threads lose; the threshold sits above that with margin |
-| 8 workers instead of 4 | **not shipped**: +4-12% at 65k-200k on a 70%-busy host; not worth the extra cores |
-| `anneal_bounds` on the existing 8-thread Python slice pool (1M+ centers) | **kept as-is**: 14.5 ms vs 63.5 ms serial at 5M, 50.8 vs 160.2 ms at 20M — re-measured this session, it wins, so it was not reverted |
+| pair clause of the gate (`n * k >= 393,216`) | **kept, but narrower than documented**: it only binds for 16,384 <= `n` <= 65,535; at `n = 16384` even `k = 96` stays serial (see the rule table above) |
+| 8 workers instead of 4 | **not shipped**: measured 47.94 vs 58.25 ms at 200k and 22.42 vs 22.82 ms at 65k — under 1.25x on a 70 — 80%-busy host, not worth the extra cores |
+| `anneal_bounds` on the existing 8-thread Python slice pool (1M+ centers) | **kept as-is**: 10.67 ms vs 41.03 ms serial at 5M, 42.90 vs 202.91 ms at 20M (re-measured this session), so it was not reverted |
 | any new GPU kernel beyond unquantized GMM/log-GMM | **not shipped**: every other kernel is below 2 flops/byte (CPU only: memory-bound), see the GPU phase below |
 
 
@@ -250,75 +318,120 @@ threshold):
 | `adaptive_parzen_normal` | 0.16 | no — CPU only: memory-bound |
 
 CPU only: memory-bound for the last four. They stay on the CPU by design, not
-because a host API was missing.
+because a host API was missing. **The "candidate?" column is an estimate from
+an arithmetic flop count, and this session's measurements do not reproduce its
+conclusion for the one row it marks "yes".** `gmm_lpdf` at 200k x 48 sustains
+only 1.6 — 2.1 Gflop/s on the CPU across `k` = 4 — 192 (measured, flop model:
+10 flops per component), against a nominal ~1.15 Tflop/s ceiling. If that were
+the whole story, 6.4 flops/byte would put it well above any bandwidth wall: its
+minimum traffic is 3.2 MB per call and it runs at ~0.1 GB/s. It is neither
+bandwidth-bound nor throughput-bound in the modelled sense, so the >2 flops/byte
+rule is not what decides whether the device helps. What actually decides it is
+the per-call CUDA context cost, measured below.
 
 **Gate — shared GPU memory.** `nvidia-smi --query-gpu=memory.free` reported
-**4309 MiB** free before this phase (32.6 GiB card, 12 foreign CUDA contexts
-holding ~27.8 GiB), so the 4000 MiB floor was cleared and the phase proceeded.
-That margin is real but thin: the same query returned 3240 MiB seconds later
-while other jobs allocated, and the product's own gate (`_GPU_MIN_FREE_MIB`)
-correctly refused the device at that moment. Our own device residency measured
-754 MiB (`nvidia-smi --query-compute-apps`), well under the 2 GiB per-call
-budget.
+**5101 MiB** free before this session's runs (32.6 GiB card, 12 foreign CUDA
+contexts holding ~27.8 GiB), clearing the 4000 MiB floor. Our own device
+residency measured **754 MiB** (`nvidia-smi --query-compute-apps`, a new
+process appearing with exactly that figure), and free memory fell **5101 MiB →
+3548 MiB** after the first device call, which puts later calls below the floor
+and makes the product's own gate decline them. That is the 4309 MiB / 3240 MiB
+picture the phase reported, re-measured: the host's free figure moves by
+hundreds of MiB as other jobs allocate.
 
-**Before / after, measured this session** (paired, interleaved CPU vs
-`device="gpu"` calls on the same buffers in one process, best of 9, K = 48):
+**CPU vs `device="gpu"`, re-measured this session.** This is the table that did
+not reproduce. Each `n` was run in a **fresh process** with the gate bypassed
+(`tpe._gpu_memory_available` stubbed to `True`) so the device was actually
+used; CPU is the best of 7, the device column reports both the first call in the
+process and the best of 5 after it, K = 48:
 
-| n | CPU | `device="gpu"` | CPU / GPU | device output |
-| ---: | ---: | ---: | ---: | --- |
-| 24 (real TPE caller size) | 0.20 ms | 30.55 ms | **0.01x** | matches |
-| 1,000 | 2.00 ms | 33.04 ms | **0.06x** | matches |
-| 20,000 | 28.92 ms | 34.15 ms | **0.85x** | matches |
-| 200,000 (benchmark size) | 53.94 ms | 91.59 ms | **0.59x** | matches |
-| 1,000,000 | 245.15 ms | 254.10 ms | **0.96x** | matches |
+| n | CPU | device, first call | device, warm | CPU / warm device | device output vs CPU |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 24 (real TPE caller size) | 0.06 ms | 395.33 ms | 2.31 ms | **0.02x** | 4.1e-11 |
+| 1,000 | 0.83 ms | 449.16 ms | 2.38 ms | **0.35x** | 7.2e-11 |
+| 20,000 | 15.71 ms | 274.46 ms | 0.36 ms | **43.52x** | 7.2e-11 |
+| 200,000 (benchmark size) | 57.43 ms | 389.58 ms | 1.42 ms | **40.31x** | 7.2e-11 |
+| 1,000,000 | 218.01 ms | 352.75 ms | 10.37 ms | **21.03x** | 7.2e-11 |
 
-The GPU wins only where the kernel dominates the per-call device setup, and it
-never won here: 1.47 ms isolated (n = 200k, back-to-back exported-symbol calls
-with nothing else on the device) still did not beat a 48.63 ms CPU call once
-the wrapper's own per-call `DeviceContext()` construction — about 30 ms — is
-added. So the honest reading is **the GPU path loses at every size measured,
-including the 200k benchmark row**, because a fresh device context per call
-costs more than the kernel saves. It was not reverted (it is opt-in, correct,
-and costs CPU callers nothing), but nothing new was built on it.
+The previous version of this table reported `device="gpu"` at 30.55 — 254.10 ms
+and a ratio of 0.01 — 0.96x, i.e. "the GPU loses at every size, including the
+200k benchmark row". **That does not reproduce.** The warm device call at
+n = 200,000 is **1.42 ms against 57.43 ms on the CPU — the device wins by about
+40x** (the row-to-row spread is 40 — 43x at 20k and 200k, 21x at 1M in the same
+units). The correction also removes the stated cause: a `DeviceContext()` is
+built per call, but it does **not** cost ~30 ms per call. The first device call
+in a process costs **274 — 449 ms**, and that is a one-time CUDA context and
+module-load cost (the `nvidia-smi` residency jump confirms a fresh context is
+being created). Every later call costs about **2 ms of fixed overhead plus the
+transfers**, which is why the device loses at n = 24 (0.06 ms of CPU work) and
+wins once the kernel is larger than that overhead (between n = 1,000 and
+n = 20,000 here).
 
-Real caller sizes are the point: a 200-evaluation TPE run issues 360
-`GMM1_lpdf` calls and **every one is n = 24** (measured by wrapping the
-wrapper). The 200k benchmark row is synthetic; no caller in this package passes
-it.
+So the honest reading, with nothing removed, is:
+
+* **A process's first device call is always a loss** (274 — 449 ms against
+  0.06 — 218 ms of CPU work): the context creation dominates.
+* **On warm calls the device wins from roughly n = 20,000 upward** (40x at the
+  200k benchmark size), and loses at the sizes TPE actually calls it with.
+* The old claim that "1.47 ms isolated still did not beat a 48.63 ms CPU call
+  once the wrapper's 30 ms is added" is contradicted by the measurement: the
+  isolated kernel figure agrees (1.4 ms warm here), but there is no 30 ms
+  per-call wrapper cost to add. The old verdict therefore rested on an error in
+  the per-call cost model, not on the device being slow.
+
+The `device="gpu"` path was not changed and was not reverted: it is opt-in,
+it is correct (differences from the CPU path are ≤ 1.9e-9 at every boundary
+size measured, see below), and it costs CPU callers nothing. What is now
+corrected is the record of what it costs and when it wins.
+
+Real caller sizes are still the point: a 200-evaluation TPE run issues 360
+`GMM1_lpdf` calls and **every one is n = 24** (re-measured by wrapping the
+wrapper; the counter printed `{24: 360}`). At n = 24 the device is ~40x
+*slower*, so the shipped code's choice of CPU as the default is right for the
+callers this package has. The 200k benchmark row is synthetic; no caller in
+this package passes it.
 
 **Transfer pattern of what ships** (unchanged, and already conforming): one
 `DeviceContext`, one `enqueue_create_buffer` per array, inputs copied in once,
 **one** kernel launch for the whole input (`grid_dim = ceil(n / 256)`), results
 copied out once, then `synchronize`. The kernel returns early for
-`i >= n`, so the grid tail is explicit rather than padded. Verified at n = 1,
-255, 256, 257, 4097 and 200,003 (device block boundary ±1): maximum absolute
-difference from the CPU path **0.00e+00** at all of them, and 7.15e-11 at
-200,000 over random draws.
+`i >= n`, so the grid tail is explicit rather than padded. Re-measured this
+session against the CPU kernel at every block boundary: maximum absolute
+difference **7.2e-11** for GMM at n = 1 / 255 / 256 / 257 / 4097 / 10003 /
+200003 and **≤ 1.9e-9** for log-GMM at the same sizes (GMM agrees to 3.9e-11 at
+n = 1). The earlier "0.00e+00 at all of them" was wrong: the two paths do not
+agree exactly, they agree to about 1e-10.
 
 **GPU tests** use `device="gpu"` and `pytest.skip("GPU unavailable or has less
 than 4000 MiB free")` when the device or its memory floor is absent, so a
 CPU-only host skips them cleanly. `tests/test_kernels.py` covers both kernels
 end to end at n = 10,003 (not a multiple of the 256-thread block), the grid
 tail at n = 1/255/256/257/200,003, the 2 GiB budget boundary, the explicit CPU
-fallback when the gate says no, and the rejection of an unknown device.
+fallback when the gate says no, and the rejection of an unknown device. This
+session ran the suite with **354 passed, 6 skipped**; all six skips are the GPU
+cases carrying the reason string above.
 
 On this shared host, **a process gets one GPU call and later calls skip, for a
 real reason**: the first device call allocates a 754 MiB context that stays
-resident, so `nvidia-smi` free memory goes from **5101 MiB to 3550 MiB** and
+resident, so `nvidia-smi` free memory goes from **5101 MiB to 3548 MiB** and
 the product's own 4000 MiB floor then declines every later call in that
-process. Measured directly: `_gpu_memory_available` is `True` for n =
-1/255/256/257/200,003 before any call and `False` for all of them after one
-`device="gpu"` call. The full suite therefore reports **354 passed, 6
-skipped** at 4309 MiB free, and which device cases land before that first
-allocation depends on whether the card is above 4000 MiB at that moment
-(another job on this box holds ~27.8 GiB and its free figure moves by
-hundreds of MiB). No test fails — every skip carries the reason string above.
-On a CPU-only host the same cases skip for missing hardware.
+process. Measured directly this session: `_gpu_memory_available` is `True` for
+n = 1/255/256/257/200,003 before any call and `False` for all of them after one
+`device="gpu"` call, with free memory reading 4309 MiB before and 3550 MiB
+after. Which device cases land before that first allocation depends on whether
+the card is above 4000 MiB at that moment (another job on this box holds
+~27.8 GiB and its free figure moves by hundreds of MiB). No test fails — every
+skip carries the reason string above. On a CPU-only host the same cases skip
+for missing hardware.
 
 The `GMM log-density GPU, 200k x 48` benchmark row measures
 `GMM1_lpdf(..., device="gpu")` and falls back to the CPU when the gate declines,
 so that row is not a device measurement on a contended host; the paired table
-above is the device measurement.
+above is the device measurement. `bench/bench.py` warms up with one untimed
+`ours()` call before timing, and that warm-up is the call that consumes the
+process's single device allocation, so the timed repetitions are always CPU
+ones. The row is kept in the table because it is what `pixi run bench`
+produces, and its numbers are labelled accordingly.
 
 Run `pixi run bench` to reproduce the table. The task takes a machine-wide
 file lock so concurrent benchmark jobs do not overlap.
