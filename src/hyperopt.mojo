@@ -11,7 +11,9 @@ comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
 comptime EPS = 1.0e-12
 comptime SQRT_2 = 1.4142135623730950488
 comptime SQRT_2PI = 2.5066282746310005024
-
+# Components are walked LANES at a time with independent partial sums, combined
+# once at the end: a single running sum serialises on floating-point add latency.
+comptime LANES = 8
 
 def fp(addr: Int) -> FPtr:
     return FPtr(unsafe_from_address=addr)
@@ -26,6 +28,27 @@ def normal_cdf(x: Float64, mu: Float64, sigma: Float64) -> Float64:
     if denom < EPS:
         denom = EPS
     return 0.5 * (1.0 + erf((x - mu) / denom))
+
+
+def normal_log_term(x: Float64, mu: Float64, weight: Float64, sigma: Float64) -> Float64:
+    var z = (x - mu) / sigma
+    return -0.5 * z * z + log(weight / (SQRT_2PI * sigma))
+
+
+def lognormal_log_term(x: Float64, log_x: Float64, mu: Float64, weight: Float64, sigma: Float64) -> Float64:
+    var z = (log_x - mu) / sigma
+    return -0.5 * z * z + log(weight) - log(SQRT_2PI * sigma * x)
+
+
+def clamp_sigmas(sigmas: FPtr, k: Int):
+    """Replace out-of-range sigmas once per call instead of once per element."""
+    for j in range(k):
+        if sigmas[unsafe_offset=j] < EPS:
+            sigmas[unsafe_offset=j] = EPS
+
+
+def clamp_sigmas_addr(sigmas_addr: Int, k: Int):
+    clamp_sigmas(FPtr(unsafe_from_address=sigmas_addr), k)
 
 
 def acceptance(
@@ -70,26 +93,46 @@ def gmm_lpdf(
     var p_accept = acceptance(
         weights, mus, sigmas, k, low, high, has_low, has_high
     )
+    var log_p_accept = log(p_accept)
     if not quantized:
+        clamp_sigmas(sigmas, k)
         for i in range(n):
-            var max_term = -1.0e300
-            for j in range(k):
-                var sigma = sigmas[unsafe_offset=j]
-                if sigma < EPS:
-                    sigma = EPS
-                var z = (samples[unsafe_offset=i] - mus[unsafe_offset=j]) / sigma
-                var term = -0.5 * z * z + log(weights[unsafe_offset=j] / (SQRT_2PI * sigma))
-                if term > max_term:
-                    max_term = term
-            var total = Float64(0.0)
-            for j in range(k):
-                var sigma = sigmas[unsafe_offset=j]
-                if sigma < EPS:
-                    sigma = EPS
-                var z = (samples[unsafe_offset=i] - mus[unsafe_offset=j]) / sigma
-                var term = -0.5 * z * z + log(weights[unsafe_offset=j] / (SQRT_2PI * sigma))
-                total += exp(term - max_term)
-            result[unsafe_offset=i] = log(total) + max_term - log(p_accept)
+            var x = samples[unsafe_offset=i]
+            var max_term = Float64(-1.0e300)
+            var j = 0
+            while j + LANES <= k:
+                var best01 = max(normal_log_term(x, mus[unsafe_offset=j + 0], weights[unsafe_offset=j + 0], sigmas[unsafe_offset=j + 0]), normal_log_term(x, mus[unsafe_offset=j + 1], weights[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]))
+                var best23 = max(normal_log_term(x, mus[unsafe_offset=j + 2], weights[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]), normal_log_term(x, mus[unsafe_offset=j + 3], weights[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]))
+                var best45 = max(normal_log_term(x, mus[unsafe_offset=j + 4], weights[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]), normal_log_term(x, mus[unsafe_offset=j + 5], weights[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]))
+                var best67 = max(normal_log_term(x, mus[unsafe_offset=j + 6], weights[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]), normal_log_term(x, mus[unsafe_offset=j + 7], weights[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]))
+                max_term = max(max_term, max(max(best01, best23), max(best45, best67)))
+                j += LANES
+            while j < k:
+                max_term = max(max_term, normal_log_term(x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]))
+                j += 1
+            var a0 = Float64(0.0)
+            var a1 = Float64(0.0)
+            var a2 = Float64(0.0)
+            var a3 = Float64(0.0)
+            var a4 = Float64(0.0)
+            var a5 = Float64(0.0)
+            var a6 = Float64(0.0)
+            var a7 = Float64(0.0)
+            j = 0
+            while j + LANES <= k:
+                a0 += exp(normal_log_term(x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]) - max_term)
+                a1 += exp(normal_log_term(x, mus[unsafe_offset=j + 1], weights[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]) - max_term)
+                a2 += exp(normal_log_term(x, mus[unsafe_offset=j + 2], weights[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]) - max_term)
+                a3 += exp(normal_log_term(x, mus[unsafe_offset=j + 3], weights[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]) - max_term)
+                a4 += exp(normal_log_term(x, mus[unsafe_offset=j + 4], weights[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]) - max_term)
+                a5 += exp(normal_log_term(x, mus[unsafe_offset=j + 5], weights[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]) - max_term)
+                a6 += exp(normal_log_term(x, mus[unsafe_offset=j + 6], weights[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]) - max_term)
+                a7 += exp(normal_log_term(x, mus[unsafe_offset=j + 7], weights[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]) - max_term)
+                j += LANES
+            while j < k:
+                a0 += exp(normal_log_term(x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]) - max_term)
+                j += 1
+            result[unsafe_offset=i] = log((((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)))) + max_term - log_p_accept
         return
 
     for i in range(n):
@@ -99,13 +142,29 @@ def gmm_lpdf(
             lower = low
         if has_high and upper > high:
             upper = high
-        var probability = Float64(0.0)
-        for j in range(k):
-            probability += weights[unsafe_offset=j] * (
-                normal_cdf(upper, mus[unsafe_offset=j], sigmas[unsafe_offset=j])
-                - normal_cdf(lower, mus[unsafe_offset=j], sigmas[unsafe_offset=j])
-            )
-        result[unsafe_offset=i] = log(probability) - log(p_accept)
+        var a0 = Float64(0.0)
+        var a1 = Float64(0.0)
+        var a2 = Float64(0.0)
+        var a3 = Float64(0.0)
+        var a4 = Float64(0.0)
+        var a5 = Float64(0.0)
+        var a6 = Float64(0.0)
+        var a7 = Float64(0.0)
+        var j = 0
+        while j + LANES <= k:
+            a0 += weights[unsafe_offset=j] * (normal_cdf(upper, mus[unsafe_offset=j], sigmas[unsafe_offset=j]) - normal_cdf(lower, mus[unsafe_offset=j], sigmas[unsafe_offset=j]))
+            a1 += weights[unsafe_offset=j + 1] * (normal_cdf(upper, mus[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]) - normal_cdf(lower, mus[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]))
+            a2 += weights[unsafe_offset=j + 2] * (normal_cdf(upper, mus[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]) - normal_cdf(lower, mus[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]))
+            a3 += weights[unsafe_offset=j + 3] * (normal_cdf(upper, mus[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]) - normal_cdf(lower, mus[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]))
+            a4 += weights[unsafe_offset=j + 4] * (normal_cdf(upper, mus[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]) - normal_cdf(lower, mus[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]))
+            a5 += weights[unsafe_offset=j + 5] * (normal_cdf(upper, mus[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]) - normal_cdf(lower, mus[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]))
+            a6 += weights[unsafe_offset=j + 6] * (normal_cdf(upper, mus[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]) - normal_cdf(lower, mus[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]))
+            a7 += weights[unsafe_offset=j + 7] * (normal_cdf(upper, mus[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]) - normal_cdf(lower, mus[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]))
+            j += LANES
+        while j < k:
+            a0 += weights[unsafe_offset=j] * (normal_cdf(upper, mus[unsafe_offset=j], sigmas[unsafe_offset=j]) - normal_cdf(lower, mus[unsafe_offset=j], sigmas[unsafe_offset=j]))
+            j += 1
+        result[unsafe_offset=i] = log((((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)))) - log_p_accept
 
 
 def gmm_lpdf_gpu_kernel(
@@ -210,34 +269,47 @@ def lgmm_lpdf(
     var p_accept = acceptance(
         weights, mus, sigmas, k, low, high, has_low, has_high
     )
+    var log_p_accept = log(p_accept)
     if not quantized:
+        clamp_sigmas(sigmas, k)
         for i in range(n):
-            var max_term = -1.0e300
-            for j in range(k):
-                var sigma = sigmas[unsafe_offset=j]
-                if sigma < EPS:
-                    sigma = EPS
-                var z = (log(samples[unsafe_offset=i]) - mus[unsafe_offset=j]) / sigma
-                var term = (
-                    -0.5 * z * z
-                    + log(weights[unsafe_offset=j])
-                    - log(SQRT_2PI * sigma * samples[unsafe_offset=i])
-                )
-                if term > max_term:
-                    max_term = term
-            var total = Float64(0.0)
-            for j in range(k):
-                var sigma = sigmas[unsafe_offset=j]
-                if sigma < EPS:
-                    sigma = EPS
-                var z = (log(samples[unsafe_offset=i]) - mus[unsafe_offset=j]) / sigma
-                var term = (
-                    -0.5 * z * z
-                    + log(weights[unsafe_offset=j])
-                    - log(SQRT_2PI * sigma * samples[unsafe_offset=i])
-                )
-                total += exp(term - max_term)
-            result[unsafe_offset=i] = log(total) + max_term
+            var x = samples[unsafe_offset=i]
+            var log_x = log(x)
+            var max_term = Float64(-1.0e300)
+            var j = 0
+            while j + LANES <= k:
+                var best01 = max(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 0], weights[unsafe_offset=j + 0], sigmas[unsafe_offset=j + 0]), lognormal_log_term(x, log_x, mus[unsafe_offset=j + 1], weights[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]))
+                var best23 = max(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 2], weights[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]), lognormal_log_term(x, log_x, mus[unsafe_offset=j + 3], weights[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]))
+                var best45 = max(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 4], weights[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]), lognormal_log_term(x, log_x, mus[unsafe_offset=j + 5], weights[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]))
+                var best67 = max(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 6], weights[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]), lognormal_log_term(x, log_x, mus[unsafe_offset=j + 7], weights[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]))
+                max_term = max(max_term, max(max(best01, best23), max(best45, best67)))
+                j += LANES
+            while j < k:
+                max_term = max(max_term, lognormal_log_term(x, log_x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]))
+                j += 1
+            var a0 = Float64(0.0)
+            var a1 = Float64(0.0)
+            var a2 = Float64(0.0)
+            var a3 = Float64(0.0)
+            var a4 = Float64(0.0)
+            var a5 = Float64(0.0)
+            var a6 = Float64(0.0)
+            var a7 = Float64(0.0)
+            j = 0
+            while j + LANES <= k:
+                a0 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]) - max_term)
+                a1 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 1], weights[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]) - max_term)
+                a2 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 2], weights[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]) - max_term)
+                a3 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 3], weights[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]) - max_term)
+                a4 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 4], weights[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]) - max_term)
+                a5 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 5], weights[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]) - max_term)
+                a6 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 6], weights[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]) - max_term)
+                a7 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j + 7], weights[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]) - max_term)
+                j += LANES
+            while j < k:
+                a0 += exp(lognormal_log_term(x, log_x, mus[unsafe_offset=j], weights[unsafe_offset=j], sigmas[unsafe_offset=j]) - max_term)
+                j += 1
+            result[unsafe_offset=i] = log((((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)))) + max_term
         return
 
     for i in range(n):
@@ -246,20 +318,36 @@ def lgmm_lpdf(
         if lower < 0.0:
             lower = 0.0
         if has_low:
-            var exp_low = exp(low)
-            if lower < exp_low:
-                lower = exp_low
+            var floor = exp(low)
+            if lower < floor:
+                lower = floor
         if has_high:
-            var exp_high = exp(high)
-            if upper > exp_high:
-                upper = exp_high
-        var probability = Float64(0.0)
-        for j in range(k):
-            probability += weights[unsafe_offset=j] * (
-                lognormal_cdf(upper, mus[unsafe_offset=j], sigmas[unsafe_offset=j])
-                - lognormal_cdf(lower, mus[unsafe_offset=j], sigmas[unsafe_offset=j])
-            )
-        result[unsafe_offset=i] = log(probability) - log(p_accept)
+            var ceiling = exp(high)
+            if upper > ceiling:
+                upper = ceiling
+        var a0 = Float64(0.0)
+        var a1 = Float64(0.0)
+        var a2 = Float64(0.0)
+        var a3 = Float64(0.0)
+        var a4 = Float64(0.0)
+        var a5 = Float64(0.0)
+        var a6 = Float64(0.0)
+        var a7 = Float64(0.0)
+        var j = 0
+        while j + LANES <= k:
+            a0 += weights[unsafe_offset=j] * (lognormal_cdf(upper, mus[unsafe_offset=j], sigmas[unsafe_offset=j]) - lognormal_cdf(lower, mus[unsafe_offset=j], sigmas[unsafe_offset=j]))
+            a1 += weights[unsafe_offset=j + 1] * (lognormal_cdf(upper, mus[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]) - lognormal_cdf(lower, mus[unsafe_offset=j + 1], sigmas[unsafe_offset=j + 1]))
+            a2 += weights[unsafe_offset=j + 2] * (lognormal_cdf(upper, mus[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]) - lognormal_cdf(lower, mus[unsafe_offset=j + 2], sigmas[unsafe_offset=j + 2]))
+            a3 += weights[unsafe_offset=j + 3] * (lognormal_cdf(upper, mus[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]) - lognormal_cdf(lower, mus[unsafe_offset=j + 3], sigmas[unsafe_offset=j + 3]))
+            a4 += weights[unsafe_offset=j + 4] * (lognormal_cdf(upper, mus[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]) - lognormal_cdf(lower, mus[unsafe_offset=j + 4], sigmas[unsafe_offset=j + 4]))
+            a5 += weights[unsafe_offset=j + 5] * (lognormal_cdf(upper, mus[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]) - lognormal_cdf(lower, mus[unsafe_offset=j + 5], sigmas[unsafe_offset=j + 5]))
+            a6 += weights[unsafe_offset=j + 6] * (lognormal_cdf(upper, mus[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]) - lognormal_cdf(lower, mus[unsafe_offset=j + 6], sigmas[unsafe_offset=j + 6]))
+            a7 += weights[unsafe_offset=j + 7] * (lognormal_cdf(upper, mus[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]) - lognormal_cdf(lower, mus[unsafe_offset=j + 7], sigmas[unsafe_offset=j + 7]))
+            j += LANES
+        while j < k:
+            a0 += weights[unsafe_offset=j] * (lognormal_cdf(upper, mus[unsafe_offset=j], sigmas[unsafe_offset=j]) - lognormal_cdf(lower, mus[unsafe_offset=j], sigmas[unsafe_offset=j]))
+            j += 1
+        result[unsafe_offset=i] = log((((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)))) - log_p_accept
 
 
 def forgetting_weight(index: Int, n: Int, lf: Int) -> Float64:

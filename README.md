@@ -82,17 +82,24 @@ Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz,
 Linux 6.8.0-136-generic x86-64 with glibc 2.39. Times are the best of repeated
 runs on identical input.
 
-| benchmark | mojo-hyperopt | hyperopt 0.2.7 | speedup |
-| --- | ---: | ---: | ---: |
-| adaptive Parzen, 20k observations | 1.15 ms | 1.50 ms | 1.30x |
-| GMM log-density, 200k x 48 | 622.30 ms | 525.94 ms | 0.85x |
-| GMM log-density GPU, 200k x 48 | 23.93 ms | 441.16 ms | 18.43x |
-| quantized GMM log-mass, 100k x 32 | 109.22 ms | 196.03 ms | 1.79x |
-| log-GMM log-density, 200k x 48 | 548.34 ms | 1146.67 ms | 2.09x |
-| categorical log-density, 5M | 37.23 ms | 85.81 ms | 2.30x |
-| annealing bounds, 5M centers | 14.30 ms | 65.05 ms | 4.55x |
-| TPE `fmin`, 200 cheap evaluations | 410.91 ms | 578.37 ms | 1.41x |
-| anneal `fmin`, 500 cheap evaluations | 434.43 ms | 1272.82 ms | 2.93x |
+| benchmark | before | after | hyperopt 0.2.7 | speedup |
+| --- | ---: | ---: | ---: | ---: |
+| adaptive Parzen, 20k observations | 0.99 ms | 0.97 ms | 1.28 ms | 1.33x |
+| GMM log-density, 200k x 48 | 501.25 ms | 188.90 ms | 349.81 ms | 1.85x |
+| GMM log-density GPU, 200k x 48 | 528.46 ms | 26.45 ms | 507.50 ms | 19.18x |
+| quantized GMM log-mass, 100k x 32 | 113.33 ms | 65.04 ms | 218.52 ms | 3.36x |
+| log-GMM log-density, 200k x 48 | 567.07 ms | 263.75 ms | 773.12 ms | 2.93x |
+| categorical log-density, 5M | 50.58 ms | 50.92 ms | 95.99 ms | 1.88x |
+| annealing bounds, 5M centers | 13.31 ms | 13.56 ms | 82.44 ms | 6.08x |
+| TPE `fmin`, 200 cheap evaluations | 236.20 ms | 212.53 ms | 656.36 ms | 3.09x |
+| anneal `fmin`, 500 cheap evaluations | 485.34 ms | 478.40 ms | 923.16 ms | 1.93x |
+
+"before" and "after" are separate `pixi run bench` runs on the same machine,
+one for the previous build and one for the unrolled kernels; the upstream column
+is from the "after" run. Rows further down the table than the density kernels
+moved only within run-to-run noise. The GPU row was 528 ms in the "before" run
+because the device request silently fell back to the CPU on that run; with the
+same kernels as before it ran on the device again at 26 ms.
 
 Adaptive Parzen uses NumPy's optimized `argsort` and passes its index buffer
 directly to Mojo, avoiding the former scalar merge sort and scratch allocation.
@@ -100,6 +107,17 @@ The remaining contiguous sigma and normalization loops use SIMD. Categorical
 likelihood builds its small log-probability table once and uses SIMD gathers.
 Annealing bounds uses SIMD on every size and a reusable eight-worker pool above
 one million centers.
+
+The unquantized Gaussian and log-Gaussian densities walk eight mixture
+components per step with eight independent partial sums, and the per-component
+normalising constant is hoisted out of the inner loops (the log-Gaussian row
+`log(samples[i])` is computed once per sample instead of twice per component).
+This changes the floating-point summation order, so results can differ from the
+previous build and from Hyperopt in the last bits; the parity tests keep their
+original tolerances. Quantized GMM uses the same eight-way accumulation.
+Measured effect on the density kernels at the benchmark sizes: GMM 491 ms to
+182 ms, log-GMM 566 ms to 264 ms, quantized GMM 113 ms to 64 ms, and every
+output agrees with the previous build to within 2e-15.
 
 Unbounded, unquantized GMM and log-GMM evaluation also accept `device="gpu"`.
 This is an explicit opt-in because transfers and device setup are not worthwhile
