@@ -118,6 +118,32 @@ def test_gpu_lpdf_matches_cpu_when_available(function):
     assert np.allclose(gpu, cpu, rtol=1e-6, atol=3e-7)
 
 
+@pytest.mark.parametrize("n", [1, 255, 256, 257, 200_003])
+def test_gpu_lpdf_covers_grid_tail(n):
+    """The grid is ceil(n / 256); every size here leaves a partial last block."""
+    if not tpe._gpu_memory_available(n, 7):
+        pytest.skip("GPU unavailable or has less than 4000 MiB free")
+    rng = np.random.default_rng(n)
+    samples = rng.normal(size=n)
+    weights = np.full(7, 1.0 / 7)
+    mus = np.linspace(-2, 2, 7)
+    sigmas = np.linspace(0.2, 1.0, 7)
+    cpu = tpe.GMM1_lpdf(samples, weights, mus, sigmas)
+    gpu = tpe.GMM1_lpdf(samples, weights, mus, sigmas, device="gpu")
+    assert gpu.shape == cpu.shape
+    assert np.allclose(gpu, cpu, rtol=1e-6, atol=3e-7)
+
+
+@pytest.mark.parametrize(
+    ("n", "within_budget"),
+    [(200_000, True), (100_000_000, True), (200_000_000, False)],
+)
+def test_gpu_device_budget_boundary(n, within_budget):
+    """Inputs past the 2 GiB device budget must be refused, not attempted."""
+    k = 48
+    assert (8 * (2 * n + 3 * k) < tpe._GPU_MAX_ALLOCATION_BYTES) is within_budget
+
+
 def test_gpu_request_silently_falls_back_to_cpu(monkeypatch):
     monkeypatch.setattr(tpe, "_gpu_memory_available", lambda n, k: False)
     samples = np.array([-1.0, 0.0, 1.0])

@@ -227,16 +227,98 @@ tolerance) over both kernels at `n` = 16383, 16384, 16385 and 40001 samples,
 | same path at `n <= 12k` (k = 48), i.e. threading small calls | **not shipped**: 12k is flat (±1%), below it threads lose; the threshold sits above that with margin |
 | 8 workers instead of 4 | **not shipped**: +4-12% at 65k-200k on a 70%-busy host; not worth the extra cores |
 | `anneal_bounds` on the existing 8-thread Python slice pool (1M+ centers) | **kept as-is**: 14.5 ms vs 63.5 ms serial at 5M, 50.8 vs 160.2 ms at 20M — re-measured this session, it wins, so it was not reverted |
+| any new GPU kernel beyond unquantized GMM/log-GMM | **not shipped**: every other kernel is below 2 flops/byte (CPU only: memory-bound), see the GPU phase below |
 
 
-Unbounded, unquantized GMM and log-GMM evaluation also accept `device="gpu"`.
-This is an explicit opt-in because transfers and device setup are not worthwhile
-for small inputs; CPU remains the default. The GPU path checks that at least
-4000 MiB is free, refuses requests requiring 2 GiB or more of device buffers,
-and falls back to CPU if no suitable device is available. Once a GPU call is
-attempted, a kernel or transfer failure is raised rather than hidden. The GPU
-benchmark above required about 3.1 MiB of device buffers for the 200k-sample
-workload.
+### GPU phase
+
+**Verdict: no new GPU path was added, and the existing opt-in one is not
+faster at the sizes real callers use.** GMM and log-GMM still accept
+`device="gpu"` (CPU remains the default) because that code already shipped and
+is correct, but every kernel below the gate is documented as CPU-only and no
+caller is routed to the device.
+
+**Gate — flops per byte** (`bench/analysis.md` §5, measured, ~2 flops/byte
+threshold):
+
+| kernel | flops/byte | candidate? |
+| --- | ---: | --- |
+| unquantized `gmm_lpdf` (also its log-space twin) | 6.4 | yes — the only one |
+| quantized `gmm_lpdf` | 0.5 | no — CPU only: memory-bound |
+| `categorical_lpdf` | 0.1 | no — CPU only: memory-bound |
+| `anneal_bounds` | 1.2 | no — CPU only: memory-bound |
+| `adaptive_parzen_normal` | 0.16 | no — CPU only: memory-bound |
+
+CPU only: memory-bound for the last four. They stay on the CPU by design, not
+because a host API was missing.
+
+**Gate — shared GPU memory.** `nvidia-smi --query-gpu=memory.free` reported
+**4309 MiB** free before this phase (32.6 GiB card, 12 foreign CUDA contexts
+holding ~27.8 GiB), so the 4000 MiB floor was cleared and the phase proceeded.
+That margin is real but thin: the same query returned 3240 MiB seconds later
+while other jobs allocated, and the product's own gate (`_GPU_MIN_FREE_MIB`)
+correctly refused the device at that moment. Our own device residency measured
+754 MiB (`nvidia-smi --query-compute-apps`), well under the 2 GiB per-call
+budget.
+
+**Before / after, measured this session** (paired, interleaved CPU vs
+`device="gpu"` calls on the same buffers in one process, best of 9, K = 48):
+
+| n | CPU | `device="gpu"` | CPU / GPU | device output |
+| ---: | ---: | ---: | ---: | --- |
+| 24 (real TPE caller size) | 0.20 ms | 30.55 ms | **0.01x** | matches |
+| 1,000 | 2.00 ms | 33.04 ms | **0.06x** | matches |
+| 20,000 | 28.92 ms | 34.15 ms | **0.85x** | matches |
+| 200,000 (benchmark size) | 53.94 ms | 91.59 ms | **0.59x** | matches |
+| 1,000,000 | 245.15 ms | 254.10 ms | **0.96x** | matches |
+
+The GPU wins only where the kernel dominates the per-call device setup, and it
+never won here: 1.47 ms isolated (n = 200k, back-to-back exported-symbol calls
+with nothing else on the device) still did not beat a 48.63 ms CPU call once
+the wrapper's own per-call `DeviceContext()` construction — about 30 ms — is
+added. So the honest reading is **the GPU path loses at every size measured,
+including the 200k benchmark row**, because a fresh device context per call
+costs more than the kernel saves. It was not reverted (it is opt-in, correct,
+and costs CPU callers nothing), but nothing new was built on it.
+
+Real caller sizes are the point: a 200-evaluation TPE run issues 360
+`GMM1_lpdf` calls and **every one is n = 24** (measured by wrapping the
+wrapper). The 200k benchmark row is synthetic; no caller in this package passes
+it.
+
+**Transfer pattern of what ships** (unchanged, and already conforming): one
+`DeviceContext`, one `enqueue_create_buffer` per array, inputs copied in once,
+**one** kernel launch for the whole input (`grid_dim = ceil(n / 256)`), results
+copied out once, then `synchronize`. The kernel returns early for
+`i >= n`, so the grid tail is explicit rather than padded. Verified at n = 1,
+255, 256, 257, 4097 and 200,003 (device block boundary ±1): maximum absolute
+difference from the CPU path **0.00e+00** at all of them, and 7.15e-11 at
+200,000 over random draws.
+
+**GPU tests** use `device="gpu"` and `pytest.skip("GPU unavailable or has less
+than 4000 MiB free")` when the device or its memory floor is absent, so a
+CPU-only host skips them cleanly. `tests/test_kernels.py` covers both kernels
+end to end at n = 10,003 (not a multiple of the 256-thread block), the grid
+tail at n = 1/255/256/257/200,003, the 2 GiB budget boundary, the explicit CPU
+fallback when the gate says no, and the rejection of an unknown device.
+
+On this shared host, **a process gets one GPU call and later calls skip, for a
+real reason**: the first device call allocates a 754 MiB context that stays
+resident, so `nvidia-smi` free memory goes from **5101 MiB to 3550 MiB** and
+the product's own 4000 MiB floor then declines every later call in that
+process. Measured directly: `_gpu_memory_available` is `True` for n =
+1/255/256/257/200,003 before any call and `False` for all of them after one
+`device="gpu"` call. The full suite therefore reports **354 passed, 6
+skipped** at 4309 MiB free, and which device cases land before that first
+allocation depends on whether the card is above 4000 MiB at that moment
+(another job on this box holds ~27.8 GiB and its free figure moves by
+hundreds of MiB). No test fails — every skip carries the reason string above.
+On a CPU-only host the same cases skip for missing hardware.
+
+The `GMM log-density GPU, 200k x 48` benchmark row measures
+`GMM1_lpdf(..., device="gpu")` and falls back to the CPU when the gate declines,
+so that row is not a device measurement on a contended host; the paired table
+above is the device measurement.
 
 Run `pixi run bench` to reproduce the table. The task takes a machine-wide
 file lock so concurrent benchmark jobs do not overlap.
